@@ -197,7 +197,28 @@ func (t *transport) attachVolume(vol playback.VolumeControl) {
 	t.logf("volume: attached %v (level=%d, mute=%s)", vol, t.volume, muteMode)
 }
 
-func (t *transport) syncVolume(force bool) {
+type positionReader interface {
+	Position() (pos, duration time.Duration)
+}
+
+func (t *transport) samplePosition() {
+	if t.p == nil || t.ended {
+		return
+	}
+	var pos, dur time.Duration
+	if pr, ok := t.p.(positionReader); ok {
+		pos, dur = pr.Position()
+	} else {
+		s := t.p.Status()
+		pos, dur = s.Position, s.Duration
+	}
+	t.pos = pos
+	if dur > 0 {
+		t.duration = dur
+	}
+}
+
+func (t *transport) syncVolume(force, watch bool) {
 	if t.vol == nil {
 		if t.probeVol == nil {
 			return
@@ -215,7 +236,7 @@ func (t *transport) syncVolume(force bool) {
 		if !force && time.Now().Before(t.nextProbe) {
 			return
 		}
-	} else if !force && time.Now().Before(t.nextSync) {
+	} else if !force && (!watch || time.Now().Before(t.nextSync)) {
 		return
 	}
 	v, err := t.vol.Volume()
@@ -305,7 +326,7 @@ func (t *transport) selectTrack(i int, state string) *fault {
 	return nil
 }
 func (t *transport) openTrack(paused bool) error {
-	t.syncVolume(true)
+	t.syncVolume(true, true)
 	p, err := t.open()
 	if err != nil {
 		t.logf("error: open playback: %v", err)
@@ -517,9 +538,13 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 	case "GetTransportInfo":
 		return fields{"CurrentTransportState": t.state, "CurrentTransportStatus": t.status, "CurrentSpeed": "1"}, nil
 	case "GetPositionInfo":
+		t.samplePosition()
 		return fields{"Track": strconv.Itoa(num), "TrackDuration": timestamp(t.duration), "TrackMetaData": cur.metadata, "TrackURI": cur.uri, "RelTime": timestamp(t.pos), "AbsTime": timestamp(t.pos), "RelCount": "2147483647", "AbsCount": "2147483647"}, nil
 	case "GetMediaInfo":
 		next := t.q.nextTrack()
+		if nr <= 1 && t.duration == 0 {
+			t.samplePosition()
+		}
 		duration := t.duration
 		if nr > 1 {
 			duration = 0
@@ -530,7 +555,7 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 	case "GetTransportSettings":
 		return fields{"PlayMode": t.q.mode, "RecQualityMode": "NOT_IMPLEMENTED"}, nil
 	case "GetVolume":
-		t.syncVolume(true)
+		t.syncVolume(true, true)
 		return fields{"CurrentVolume": strconv.Itoa(t.volume)}, nil
 	case "SetVolume":
 		v, err := strconv.Atoi(a["DesiredVolume"])
@@ -538,7 +563,7 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 			return nil, invalid
 		}
 		if t.vol == nil || t.volOffline {
-			t.syncVolume(true)
+			t.syncVolume(true, true)
 		}
 		t.applyInitialToHW = false
 		if t.vol != nil {
@@ -561,7 +586,7 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 			t.volume = v
 		}
 	case "GetMute":
-		t.syncVolume(true)
+		t.syncVolume(true, true)
 		return fields{"CurrentMute": onOff(t.mute)}, nil
 	case "SetMute":
 		v, err := parseUPnPBool(a["DesiredMute"])
@@ -569,7 +594,7 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 			return nil, invalid
 		}
 		if t.vol == nil || t.volOffline {
-			t.syncVolume(true)
+			t.syncVolume(true, true)
 		}
 		if t.vol != nil && t.hwMute {
 			if err := t.vol.SetMute(v); err != nil {

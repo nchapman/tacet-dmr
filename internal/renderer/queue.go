@@ -35,12 +35,13 @@ var loopCodes = map[string]string{
 
 type track struct{ uri, metadata string }
 type playlist struct {
-	name    string // empty for ordinary AVTransport URI + optional next URI
-	items   []track
-	index   int // zero-based internally; only the SOAP boundary uses one-based indices
-	mode    string
-	order   []int // permutation of [0..len(items)-1] when shuffle is active
-	shuffle func(n int, swap func(i, j int))
+	name     string // empty for ordinary AVTransport URI + optional next URI
+	items    []track
+	index    int // zero-based internally; only the SOAP boundary uses one-based indices
+	mode     string
+	order    []int // permutation of [0..len(items)-1] when shuffle is active
+	orderPos int   // self-healing cache for slices.Index(order, index)
+	shuffle  func(n int, swap func(i, j int))
 }
 
 func (q *playlist) isShuffle() bool {
@@ -104,6 +105,14 @@ func (q *playlist) current() track {
 func (q *playlist) matches(name string) bool {
 	return q.name != "" && (name == currentQueue || name == q.name)
 }
+func (q *playlist) posOfCurrent() int {
+	if q.orderPos >= 0 && q.orderPos < len(q.order) && q.order[q.orderPos] == q.index {
+		return q.orderPos
+	}
+	q.orderPos = slices.Index(q.order, q.index)
+	return q.orderPos
+}
+
 func (q *playlist) step(delta int, eof bool) (int, bool) {
 	if len(q.items) == 0 {
 		return 0, false
@@ -122,7 +131,7 @@ func (q *playlist) step(delta int, eof bool) (int, bool) {
 		return 0, false
 	}
 	q.ensureOrder()
-	pos := slices.Index(q.order, q.index)
+	pos := q.posOfCurrent()
 	if pos < 0 {
 		return 0, false
 	}
@@ -286,7 +295,7 @@ func parseContext(raw string) (string, []track, *fault) {
 		Count   int        `xml:"ListInfo>TrackNumber"`
 		Tracks  wireTracks `xml:"Tracks"`
 	}
-	if xml.Unmarshal([]byte(raw), &body) != nil || strings.TrimSpace(body.Name) == "" || len(body.Name) > 256 || body.Count == 0 || body.Count != len(body.Tracks) || body.Count > maxTracks {
+	if xml.NewDecoder(strings.NewReader(raw)).Decode(&body) != nil || strings.TrimSpace(body.Name) == "" || len(body.Name) > 256 || body.Count == 0 || body.Count != len(body.Tracks) || body.Count > maxTracks {
 		return "", nil, invalid
 	}
 	return body.Name, body.Tracks, nil

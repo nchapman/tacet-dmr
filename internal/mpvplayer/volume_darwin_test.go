@@ -23,7 +23,8 @@ type fakeCoreAudioDevice struct {
 }
 
 type fakeCoreAudioHAL struct {
-	devices map[uint32]*fakeCoreAudioDevice
+	devices         map[uint32]*fakeCoreAudioDevice
+	isSettableCalls int
 }
 
 func (h *fakeCoreAudioHAL) deviceIDs() ([]uint32, error) {
@@ -43,6 +44,7 @@ func (h *fakeCoreAudioHAL) deviceUID(id uint32) (string, bool) {
 }
 
 func (h *fakeCoreAudioHAL) isSettable(id uint32, selector uint32) bool {
+	h.isSettableCalls++
 	d, ok := h.devices[id]
 	if !ok {
 		return false
@@ -254,5 +256,50 @@ func TestSystemCoreAudioReadOnlySmoke(t *testing.T) {
 		if !ok || uid == "" {
 			t.Errorf("device %d returned empty UID", id)
 		}
+	}
+}
+
+func TestCoreAudioVolumeCachesSelectorsPerDeviceID(t *testing.T) {
+	hal := &fakeCoreAudioHAL{
+		devices: map[uint32]*fakeCoreAudioDevice{
+			42: {uid: "DAC-UID", hasVMVC: true, vmvcSettable: true, vmvc: 0.5, hasMute: true, muteSettable: true},
+		},
+	}
+	ctrl := openCoreAudioVolume(hal, "DAC-UID")
+	if ctrl == nil {
+		t.Fatal("expected volume control")
+	}
+	// First Mute() probes caMute once; subsequent Volume/SetVolume/Mute/SetMute
+	// calls on the same cachedID must reuse cached selectors without re-probing.
+	if _, err := ctrl.Mute(); err != nil {
+		t.Fatal(err)
+	}
+	afterInit := hal.isSettableCalls
+	for range 5 {
+		if _, err := ctrl.Volume(); err != nil {
+			t.Fatal(err)
+		}
+		if err := ctrl.SetVolume(40); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ctrl.Mute(); err != nil {
+			t.Fatal(err)
+		}
+		if err := ctrl.SetMute(false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if hal.isSettableCalls != afterInit {
+		t.Fatalf("isSettable re-probed %d extra times on stable AudioDeviceID", hal.isSettableCalls-afterInit)
+	}
+
+	// Replug with a new AudioDeviceID invalidates cached selectors cleanly.
+	delete(hal.devices, 42)
+	hal.devices[99] = &fakeCoreAudioDevice{uid: "DAC-UID", hasVOLM: true, volmSettable: true, volm: 0.6}
+	if v, err := ctrl.Volume(); err != nil || v != 60 {
+		t.Fatalf("after replug: v=%d err=%v", v, err)
+	}
+	if _, err := ctrl.Mute(); !errors.Is(err, playback.ErrUnsupported) {
+		t.Fatalf("expected ErrUnsupported mute after replug, got %v", err)
 	}
 }

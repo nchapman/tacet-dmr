@@ -62,8 +62,16 @@ func open(device string, exclusive, network bool) (*Player, error) {
 		{"audio-fallback-to-null", "no"},
 	}
 	if network {
-		options = append(options, [2]string{"prefetch-playlist", "yes"}, [2]string{"stop-playback-on-init-failure", "yes"}, [2]string{"access-references", "no"}, [2]string{"demuxer", "lavf"},
-			[2]string{"demuxer-lavf-o", "format_whitelist=[wav,flac,mp3,ogg,mov,aac,aiff]"}, [2]string{"network-timeout", "10"})
+		options = append(options,
+			[2]string{"prefetch-playlist", "yes"},
+			[2]string{"demuxer-max-bytes", "32MiB"},
+			[2]string{"demuxer-max-back-bytes", "8MiB"},
+			[2]string{"stop-playback-on-init-failure", "yes"},
+			[2]string{"access-references", "no"},
+			[2]string{"demuxer", "lavf"},
+			[2]string{"demuxer-lavf-o", "format_whitelist=[wav,flac,mp3,ogg,mov,aac,aiff,matroska,webm,dsf,wv,ape,asf]"},
+			[2]string{"network-timeout", "10"},
+		)
 	}
 	if device != "" {
 		options = append(options, [2]string{"audio-device", device})
@@ -186,20 +194,25 @@ func safeDuration(sec float64) time.Duration {
 	return time.Duration(sec * float64(time.Second))
 }
 
-func (p *Player) Status() playback.Status {
-	// Media properties are legitimately unavailable before loading and at EOF.
+func (p *Player) Position() (pos, duration time.Duration) {
 	seconds := func(key string) time.Duration {
 		v, _ := p.m.GetProperty(key, mpv.FormatDouble)
 		f, _ := v.(float64)
 		return safeDuration(f)
 	}
+	return seconds("time-pos"), seconds("duration")
+}
+
+func (p *Player) Status() playback.Status {
+	// Media properties are legitimately unavailable before loading and at EOF.
+	pos, dur := p.Position()
 	number := func(key string) int {
 		v, _ := p.m.GetProperty(key, mpv.FormatInt64)
 		n, _ := v.(int64)
 		return int(n)
 	}
 	return playback.Status{Track: number("playlist-pos-1"), Paused: p.m.GetPropertyString("pause") == "yes",
-		Position: seconds("time-pos"), Duration: seconds("duration"), Output: p.m.GetPropertyString("current-ao"),
+		Position: pos, Duration: dur, Output: p.m.GetPropertyString("current-ao"),
 		SourceRate: number("audio-params/samplerate"), OutputRate: number("audio-out-params/samplerate")}
 }
 

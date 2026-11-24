@@ -16,16 +16,18 @@ import (
 const eventNS = "urn:schemas-upnp-org:event-1-0"
 
 type eventState struct {
-	state, status, uri, duration, mode, next string
-	track                                    int
-	volume                                   int
-	mute                                     bool
+	state, status, uri, mode, next string
+	durationSec                    int64
+	track                          int
+	volume                         int
+	mute                           bool
 }
 
 func (t *transport) eventState() eventState {
 	num, _ := t.q.trackNumbers()
 	next := t.q.nextTrack().uri
-	return eventState{state: t.state, status: t.status, uri: t.q.current().uri, duration: timestamp(t.duration), track: num, mode: t.q.mode, next: next, volume: t.volume, mute: t.mute}
+	durSec := max(int64(0), int64(t.duration/time.Second))
+	return eventState{state: t.state, status: t.status, uri: t.q.current().uri, durationSec: durSec, track: num, mode: t.q.mode, next: next, volume: t.volume, mute: t.mute}
 }
 func (v eventState) body(s string) string {
 	var props string
@@ -36,7 +38,8 @@ func (v eventState) body(s string) string {
 		}
 	default:
 		ns := "AVT"
-		changes := `<TransportState val="` + v.state + `"/><TransportStatus val="` + v.status + `"/><CurrentTrackURI val="` + escape(v.uri) + `"/><CurrentTrackDuration val="` + v.duration + `"/>`
+		dur := timestamp(time.Duration(v.durationSec) * time.Second)
+		changes := `<TransportState val="` + v.state + `"/><TransportStatus val="` + v.status + `"/><CurrentTrackURI val="` + escape(v.uri) + `"/><CurrentTrackDuration val="` + dur + `"/>`
 		changes += fmt.Sprintf(`<CurrentTrack val="%d"/><CurrentPlayMode val="%s"/><NextAVTransportURI val="%s"/>`, v.track, v.mode, escape(v.next))
 		if s == rc {
 			ns = "RCS"
@@ -63,7 +66,7 @@ func (d *Device) publish() {
 		return
 	}
 	for _, s := range d.subs {
-		if s.service == cm || (s.service == rc && v.volume == old.volume && v.mute == old.mute) || (s.service == av && v.state == old.state && v.uri == old.uri && v.duration == old.duration && v.status == old.status && v.track == old.track && v.mode == old.mode && v.next == old.next) {
+		if s.service == cm || (s.service == rc && v.volume == old.volume && v.mute == old.mute) || (s.service == av && v.state == old.state && v.uri == old.uri && v.durationSec == old.durationSec && v.status == old.status && v.track == old.track && v.mode == old.mode && v.next == old.next) {
 			continue
 		}
 		// The initial event is delivered separately. A slow subscriber needs only the
@@ -117,63 +120,95 @@ func callbackURL(raw string, peer netip.Addr) (string, bool) {
 	return "", false
 }
 
-// Called under d.mu. All lifecycle changes serialize with state snapshots.
+func (d *Device) hasRCSubs() bool {
+	for _, s := range d.subs {
+		if s.service == rc {
+			return true
+		}
+	}
+	return false
+}
+
+// Acquires d.mu only for state validation and registry updates; writes and
+// flushes the HTTP response after releasing d.mu so a slow client cannot stall
+// playback or other SOAP requests.
 func (d *Device) subscription(w http.ResponseWriter, r *http.Request, service string) {
 	sid := r.Header.Get("SID")
-	sub := d.subs[sid]
 	peer := requestPeer(r)
 	cb := r.Header.Get("Callback")
 	nt := r.Header.Get("NT")
 	sec := timeoutSeconds(r.Header.Get("Timeout"))
 	expires := time.Now().Add(time.Duration(sec) * time.Second)
+
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		w.WriteHeader(503)
+		return
+	}
+	sub := d.subs[sid]
 	if sid != "" {
 		if cb != "" || nt != "" || sub == nil || sub.peer != peer || sub.service != service || time.Now().After(sub.expires) {
+			d.mu.Unlock()
 			w.WriteHeader(412)
 			return
 		}
 		if r.Method == "UNSUBSCRIBE" {
 			d.remove(sub)
+			d.mu.Unlock()
+			d.nudge()
 			w.WriteHeader(200)
 			return
 		}
 		sub.expires = expires
-	} else {
-		if r.Method != "SUBSCRIBE" || nt != "upnp:event" {
-			w.WriteHeader(412)
-			return
-		}
-		target, ok := callbackURL(cb, peer)
-		if !ok {
-			w.WriteHeader(412)
-			return
-		}
-		if len(d.subs) >= 16 {
-			w.WriteHeader(503)
-			return
-		}
-		if service == rc {
-			d.t.syncVolume(true)
-			d.publish()
-		}
-		sid = "uuid:" + uuid.NewString()
-		ctx, cancel := context.WithCancel(context.Background())
-		sub = &subscription{sid: sid, service: service, callback: target, peer: peer, expires: expires, cancel: cancel, updates: make(chan eventState, 1)}
-		d.subs[sid] = sub
+		d.mu.Unlock()
+		d.nudge()
 		w.Header().Set("SID", sid)
 		w.Header().Set("TIMEOUT", fmt.Sprintf("Second-%d", sec))
 		w.WriteHeader(200)
-		_ = http.NewResponseController(w).Flush()
-		d.wg.Add(1)
-		go d.notify(ctx, sub, d.t.eventState())
 		return
 	}
+	if r.Method != "SUBSCRIBE" || nt != "upnp:event" {
+		d.mu.Unlock()
+		w.WriteHeader(412)
+		return
+	}
+	target, ok := callbackURL(cb, peer)
+	if !ok {
+		d.mu.Unlock()
+		w.WriteHeader(412)
+		return
+	}
+	if len(d.subs) >= 16 {
+		d.mu.Unlock()
+		w.WriteHeader(503)
+		return
+	}
+	if service == rc {
+		d.t.syncVolume(true, true)
+		d.publish()
+	}
+	sid = "uuid:" + uuid.NewString()
+	ctx, cancel := context.WithCancel(context.Background())
+	sub = &subscription{sid: sid, service: service, callback: target, peer: peer, expires: expires, cancel: cancel, updates: make(chan eventState, 1)}
+	d.subs[sid] = sub
+	initial := d.t.eventState()
+	d.wg.Add(1)
+	d.mu.Unlock()
+
+	d.nudge()
 	w.Header().Set("SID", sid)
 	w.Header().Set("TIMEOUT", fmt.Sprintf("Second-%d", sec))
 	w.WriteHeader(200)
+	_ = http.NewResponseController(w).Flush()
+	go d.notify(ctx, sub, initial)
 }
 func (d *Device) remove(s *subscription) { s.cancel(); delete(d.subs, s.sid) }
 func (d *Device) notify(ctx context.Context, s *subscription, v eventState) {
 	defer d.wg.Done()
+	if ctx.Err() != nil {
+		return
+	}
 	var seq uint32
 	for {
 		var err error

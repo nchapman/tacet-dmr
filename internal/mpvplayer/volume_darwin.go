@@ -188,10 +188,13 @@ func (a *darwinCoreAudio) setMute(id uint32, m bool) error {
 }
 
 type coreAudioVolume struct {
-	hal      coreAudioHAL
-	uid      string
-	mu       sync.Mutex
-	cachedID uint32
+	hal          coreAudioHAL
+	uid          string
+	mu           sync.Mutex
+	cachedID     uint32
+	volSel       uint32
+	muteChecked  bool
+	muteSettable bool
 }
 
 var _ playback.VolumeControl = (*coreAudioVolume)(nil)
@@ -240,7 +243,7 @@ func openCoreAudioVolume(hal coreAudioHAL, uid string) playback.VolumeControl {
 	if err != nil {
 		return nil
 	}
-	if _, ok := c.volumeSelector(id); !ok {
+	if _, ok := c.volumeSelectorLocked(id); !ok {
 		return nil
 	}
 	return c
@@ -250,6 +253,13 @@ func (c *coreAudioVolume) String() string {
 	return "CoreAudio hardware (" + c.uid + ")"
 }
 
+func (c *coreAudioVolume) resetCacheLocked() {
+	c.cachedID = 0
+	c.volSel = 0
+	c.muteChecked = false
+	c.muteSettable = false
+}
+
 // Always verify the device UID before touching a numeric AudioDeviceID:
 // unplugging and replugging a USB DAC can reassign IDs across devices.
 func (c *coreAudioVolume) resolveLocked() (uint32, error) {
@@ -257,7 +267,7 @@ func (c *coreAudioVolume) resolveLocked() (uint32, error) {
 		if uid, ok := c.hal.deviceUID(c.cachedID); ok && uid == c.uid {
 			return c.cachedID, nil
 		}
-		c.cachedID = 0
+		c.resetCacheLocked()
 	}
 	ids, err := c.hal.deviceIDs()
 	if err != nil {
@@ -272,14 +282,27 @@ func (c *coreAudioVolume) resolveLocked() (uint32, error) {
 	return 0, fmt.Errorf("CoreAudio device %q not found", c.uid)
 }
 
-func (c *coreAudioVolume) volumeSelector(id uint32) (uint32, bool) {
+func (c *coreAudioVolume) volumeSelectorLocked(id uint32) (uint32, bool) {
+	if c.volSel != 0 {
+		return c.volSel, true
+	}
 	if c.hal.isSettable(id, caVirtualMainVolume) {
-		return caVirtualMainVolume, true
+		c.volSel = caVirtualMainVolume
+		return c.volSel, true
 	}
 	if c.hal.isSettable(id, caVolumeScalar) {
-		return caVolumeScalar, true
+		c.volSel = caVolumeScalar
+		return c.volSel, true
 	}
 	return 0, false
+}
+
+func (c *coreAudioVolume) muteSettableLocked(id uint32) bool {
+	if !c.muteChecked {
+		c.muteSettable = c.hal.isSettable(id, caMute)
+		c.muteChecked = true
+	}
+	return c.muteSettable
 }
 
 func (c *coreAudioVolume) Volume() (int, error) {
@@ -289,12 +312,13 @@ func (c *coreAudioVolume) Volume() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	sel, ok := c.volumeSelector(id)
+	sel, ok := c.volumeSelectorLocked(id)
 	if !ok {
 		return 0, playback.ErrUnsupported
 	}
 	v, err := c.hal.getFloat(id, sel)
 	if err != nil {
+		c.volSel = 0
 		return 0, err
 	}
 	f := float64(v)
@@ -320,11 +344,15 @@ func (c *coreAudioVolume) SetVolume(v int) error {
 	if err != nil {
 		return err
 	}
-	sel, ok := c.volumeSelector(id)
+	sel, ok := c.volumeSelectorLocked(id)
 	if !ok {
 		return playback.ErrUnsupported
 	}
-	return c.hal.setFloat(id, sel, float32(v)/100.0)
+	if err := c.hal.setFloat(id, sel, float32(v)/100.0); err != nil {
+		c.volSel = 0
+		return err
+	}
+	return nil
 }
 
 func (c *coreAudioVolume) Mute() (bool, error) {
@@ -334,10 +362,15 @@ func (c *coreAudioVolume) Mute() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !c.hal.isSettable(id, caMute) {
+	if !c.muteSettableLocked(id) {
 		return false, playback.ErrUnsupported
 	}
-	return c.hal.getMute(id)
+	m, err := c.hal.getMute(id)
+	if err != nil {
+		c.muteChecked = false
+		return false, err
+	}
+	return m, nil
 }
 
 func (c *coreAudioVolume) SetMute(m bool) error {
@@ -347,8 +380,12 @@ func (c *coreAudioVolume) SetMute(m bool) error {
 	if err != nil {
 		return err
 	}
-	if !c.hal.isSettable(id, caMute) {
+	if !c.muteSettableLocked(id) {
 		return playback.ErrUnsupported
 	}
-	return c.hal.setMute(id, m)
+	if err := c.hal.setMute(id, m); err != nil {
+		c.muteChecked = false
+		return err
+	}
+	return nil
 }

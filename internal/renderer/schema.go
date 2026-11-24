@@ -2,8 +2,8 @@
 package renderer
 
 import (
-	"encoding/xml"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -50,12 +50,101 @@ func serviceType(service string) string {
 	}
 	return "urn:schemas-upnp-org:service:" + service + ":1"
 }
+func writeEscaped(w io.Writer, s string) error {
+	last := 0
+	for i := 0; i < len(s); i++ {
+		var esc string
+		switch s[i] {
+		case '"':
+			esc = "&#34;"
+		case '\'':
+			esc = "&#39;"
+		case '&':
+			esc = "&amp;"
+		case '<':
+			esc = "&lt;"
+		case '>':
+			esc = "&gt;"
+		case '\t':
+			esc = "&#x9;"
+		case '\n':
+			esc = "&#xA;"
+		case '\r':
+			esc = "&#xD;"
+		default:
+			if s[i] >= 0x20 {
+				continue
+			}
+			esc = "\uFFFD"
+		}
+		if i > last {
+			if _, err := io.WriteString(w, s[last:i]); err != nil {
+				return err
+			}
+		}
+		if _, err := io.WriteString(w, esc); err != nil {
+			return err
+		}
+		last = i + 1
+	}
+	if last < len(s) {
+		_, err := io.WriteString(w, s[last:])
+		return err
+	}
+	return nil
+}
+
+type escapeWriter struct{ w io.Writer }
+
+func (e escapeWriter) Write(p []byte) (int, error) {
+	if err := writeEscaped(e.w, string(p)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (e escapeWriter) WriteString(s string) (int, error) {
+	if err := writeEscaped(e.w, s); err != nil {
+		return 0, err
+	}
+	return len(s), nil
+}
+
+func writeTag(w io.Writer, name, value string) error {
+	if _, err := io.WriteString(w, "<"); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, name); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, ">"); err != nil {
+		return err
+	}
+	if err := writeEscaped(w, value); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "</"); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, name); err != nil {
+		return err
+	}
+	_, err := io.WriteString(w, ">")
+	return err
+}
+
 func escape(s string) string {
 	var b strings.Builder
-	_ = xml.EscapeText(&b, []byte(s))
+	b.Grow(len(s))
+	_ = writeEscaped(&b, s)
 	return b.String()
 }
-func tag(name, value string) string { return "<" + name + ">" + escape(value) + "</" + name + ">" }
+func tag(name, value string) string {
+	var b strings.Builder
+	b.Grow(len(name)*2 + len(value) + 5)
+	_ = writeTag(&b, name, value)
+	return b.String()
+}
 func deviceXML(name, udn string) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><device>`)

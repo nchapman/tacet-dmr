@@ -52,17 +52,17 @@ func (t *transport) finish() {
 }
 
 func (t *transport) refresh() {
-	t.syncVolume(false)
+	t.refreshWith(true)
+}
+
+func (t *transport) refreshWith(watchVolume bool) {
+	t.syncVolume(false, watchVolume)
 	// Bound work under the service lock even for pathological, tiny repeat loops.
 	for n := 0; t.p != nil && n < 128; n++ {
 		ev, err := t.p.NextNotice(0)
 		if ev.Kind == playback.NoEvent && err == nil {
-			if !t.ended {
-				s := t.p.Status()
-				t.pos = s.Position
-				if s.Duration > 0 {
-					t.duration = s.Duration
-				}
+			if !t.ended && t.duration == 0 {
+				t.samplePosition()
 			}
 			return
 		}
@@ -121,6 +121,9 @@ func (t *transport) refresh() {
 				t.logf("play: track %d/%d %s", num, nr, sanitizeURI(t.q.current().uri))
 			}
 			t.logOutput()
+			if t.duration == 0 {
+				t.samplePosition()
+			}
 			if t.state != "PAUSED_PLAYBACK" {
 				t.state = "PLAYING"
 			}
