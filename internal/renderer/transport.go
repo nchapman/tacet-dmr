@@ -417,7 +417,7 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 		if uri != "" && !validURI(uri) {
 			return nil, &fault{714, "Illegal MIME-Type or unsupported URI"}
 		}
-		t.q = playlist{mode: normal}
+		t.q = playlist{mode: normal, shuffle: t.q.shuffle}
 		if uri != "" {
 			t.q.items = []track{{uri, a["CurrentURIMetaData"]}}
 		}
@@ -435,6 +435,7 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 		if uri != "" {
 			t.q.items = append(t.q.items, track{uri, a["NextURIMetaData"]})
 		}
+		t.q.rebuildOrder()
 	case "Next", "Previous":
 		delta := 1
 		if name == "Previous" {
@@ -446,12 +447,11 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 		}
 		return nil, t.selectTrack(i, t.state)
 	case "SetPlayMode":
-		switch m := a["NewPlayMode"]; m {
-		case normal, repeatAll, repeatOne:
-			t.q.mode = m
-		default:
+		m := a["NewPlayMode"]
+		if _, ok := loopCodes[m]; !ok {
 			return nil, &fault{712, "Play mode not supported"}
 		}
+		t.q.setMode(m)
 	case "GetCurrentTransportActions":
 		var list []string
 		if num != 0 {

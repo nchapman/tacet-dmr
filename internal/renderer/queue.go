@@ -3,28 +3,96 @@ package renderer
 import (
 	"encoding/xml"
 	"errors"
+	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
 )
 
 const (
-	maxTracks     = 10000
-	maxQueueBytes = 32 << 20 // retained URIs and DIDL, independent of request size
-	currentQueue  = "CurrentQueue"
-	normal        = "NORMAL"
-	repeatOne     = "REPEAT_ONE"
-	repeatAll     = "REPEAT_ALL"
+	maxTracks        = 10000
+	maxQueueBytes    = 32 << 20 // retained URIs and DIDL, independent of request size
+	currentQueue     = "CurrentQueue"
+	normal           = "NORMAL"
+	repeatOne        = "REPEAT_ONE"
+	repeatAll        = "REPEAT_ALL"
+	shuffleRepeatAll = "SHUFFLE"
+	shuffleNoRepeat  = "SHUFFLE_NOREPEAT"
+	shuffleRepeatOne = "SHUFFLE_REPEAT_ONE"
 )
 
-var loopCodes = map[string]string{repeatAll: "0", repeatOne: "1", normal: "4"}
+// LinkPlay LoopMode <-> UPnP AVTransport CurrentPlayMode mapping:
+// 0: repeat all, 1: repeat one, 2: shuffle + repeat all,
+// 3: shuffle (no repeat), 4: normal, 5: shuffle + repeat one.
+var loopCodes = map[string]string{
+	repeatAll:        "0",
+	repeatOne:        "1",
+	shuffleRepeatAll: "2",
+	shuffleNoRepeat:  "3",
+	normal:           "4",
+	shuffleRepeatOne: "5",
+}
 
 type track struct{ uri, metadata string }
 type playlist struct {
-	name  string // empty for ordinary AVTransport URI + optional next URI
-	items []track
-	index int // zero-based internally; only the SOAP boundary uses one-based indices
-	mode  string
+	name    string // empty for ordinary AVTransport URI + optional next URI
+	items   []track
+	index   int // zero-based internally; only the SOAP boundary uses one-based indices
+	mode    string
+	order   []int // permutation of [0..len(items)-1] when shuffle is active
+	shuffle func(n int, swap func(i, j int))
+}
+
+func (q *playlist) isShuffle() bool {
+	return q.mode == shuffleRepeatAll || q.mode == shuffleNoRepeat || q.mode == shuffleRepeatOne
+}
+func (q *playlist) isRepeatAll() bool {
+	return q.mode == repeatAll || q.mode == shuffleRepeatAll
+}
+func (q *playlist) isRepeatOne() bool {
+	return q.mode == repeatOne || q.mode == shuffleRepeatOne
+}
+func (q *playlist) doShuffle(n int, swap func(i, j int)) {
+	if q.shuffle != nil {
+		q.shuffle(n, swap)
+		return
+	}
+	rand.Shuffle(n, swap)
+}
+func (q *playlist) rebuildOrder() {
+	if !q.isShuffle() || len(q.items) == 0 {
+		q.order = nil
+		return
+	}
+	order := make([]int, 0, len(q.items))
+	if q.index >= 0 && q.index < len(q.items) {
+		order = append(order, q.index)
+	}
+	for i := range q.items {
+		if i != q.index {
+			order = append(order, i)
+		}
+	}
+	if len(order) > 2 {
+		q.doShuffle(len(order)-1, func(i, j int) { order[i+1], order[j+1] = order[j+1], order[i+1] })
+	}
+	q.order = order
+}
+func (q *playlist) setMode(mode string) {
+	wasShuffle := q.isShuffle()
+	q.mode = mode
+	if !q.isShuffle() {
+		q.order = nil
+		return
+	}
+	if !wasShuffle || len(q.order) != len(q.items) {
+		q.rebuildOrder()
+	}
+}
+func (q *playlist) ensureOrder() {
+	if q.isShuffle() && len(q.order) != len(q.items) {
+		q.rebuildOrder()
+	}
 }
 
 func (q *playlist) current() track {
@@ -40,17 +108,51 @@ func (q *playlist) step(delta int, eof bool) (int, bool) {
 	if len(q.items) == 0 {
 		return 0, false
 	}
-	if eof && q.mode == repeatOne {
+	if eof && q.isRepeatOne() {
 		return q.index, true
 	}
-	i := q.index + delta
-	if i >= 0 && i < len(q.items) {
-		return i, true
+	if !q.isShuffle() {
+		i := q.index + delta
+		if i >= 0 && i < len(q.items) {
+			return i, true
+		}
+		if q.isRepeatAll() {
+			return (i + len(q.items)) % len(q.items), true
+		}
+		return 0, false
 	}
-	if q.mode == repeatAll {
-		return (i + len(q.items)) % len(q.items), true
+	q.ensureOrder()
+	pos := slices.Index(q.order, q.index)
+	if pos < 0 {
+		return 0, false
+	}
+	next := pos + delta
+	if next >= 0 && next < len(q.order) {
+		return q.order[next], true
+	}
+	if q.isRepeatAll() {
+		return q.order[(next+len(q.order))%len(q.order)], true
 	}
 	return 0, false
+}
+func (q *playlist) appendItems(items []track) {
+	oldLen := len(q.items)
+	q.items = append(q.items, items...)
+	if !q.isShuffle() {
+		return
+	}
+	if oldLen == 0 || len(q.order) != oldLen {
+		q.rebuildOrder()
+		return
+	}
+	for i := oldLen; i < len(q.items); i++ {
+		q.order = append(q.order, i)
+	}
+	pos := slices.Index(q.order, q.index)
+	if pos >= 0 && pos+2 < len(q.order) {
+		tail := q.order[pos+1:]
+		q.doShuffle(len(tail), func(i, j int) { tail[i], tail[j] = tail[j], tail[i] })
+	}
 }
 func (q *playlist) remove(lo, hi int) (removedCurrent bool) { // inclusive
 	removedCurrent = lo <= q.index && q.index <= hi
@@ -60,6 +162,25 @@ func (q *playlist) remove(lo, hi int) (removedCurrent bool) { // inclusive
 		q.index = max(0, min(lo, len(q.items)-1))
 	case hi < q.index:
 		q.index -= hi - lo + 1
+	}
+	if q.isShuffle() {
+		if len(q.items) == 0 {
+			q.order = nil
+		} else {
+			n := 0
+			span := hi - lo + 1
+			for _, idx := range q.order {
+				if idx >= lo && idx <= hi {
+					continue
+				}
+				if idx > hi {
+					idx -= span
+				}
+				q.order[n] = idx
+				n++
+			}
+			q.order = q.order[:n]
+		}
 	}
 	return removedCurrent
 }
@@ -72,13 +193,23 @@ func (q *playlist) move(from, to int) {
 		copy(q.items[to+1:from+1], q.items[to:from])
 	}
 	q.items[to] = item
-	switch {
-	case q.index == from:
-		q.index = to
-	case from < q.index && q.index <= to:
-		q.index--
-	case to <= q.index && q.index < from:
-		q.index++
+	remap := func(idx int) int {
+		switch {
+		case idx == from:
+			return to
+		case from < idx && idx <= to:
+			return idx - 1
+		case to <= idx && idx < from:
+			return idx + 1
+		default:
+			return idx
+		}
+	}
+	q.index = remap(q.index)
+	if q.isShuffle() {
+		for i, idx := range q.order {
+			q.order[i] = remap(idx)
+		}
 	}
 }
 func parseIndex(raw string, n int) (int, bool) {
@@ -177,7 +308,7 @@ func (t *transport) queueAction(name string, a fields) (fields, *fault) {
 			if list == totalQueue {
 				return nil, invalid
 			} // reserved inventory view
-			t.q = playlist{name: list, items: items, mode: normal}
+			t.q = playlist{name: list, items: items, mode: normal, shuffle: q.shuffle}
 			t.resetTrack()
 			return nil, nil
 		}
@@ -188,7 +319,7 @@ func (t *transport) queueAction(name string, a fields) (fields, *fault) {
 			return nil, &fault{601, "Queue capacity exceeded"}
 		}
 		empty := len(q.items) == 0
-		q.items = append(q.items, items...)
+		q.appendItems(items)
 		if empty {
 			t.resetTrack()
 		}
@@ -199,7 +330,7 @@ func (t *transport) queueAction(name string, a fields) (fields, *fault) {
 		}
 		for mode, code := range loopCodes {
 			if a["LoopMode"] == code {
-				q.mode = mode
+				q.setMode(mode)
 				return nil, nil
 			}
 		}
@@ -229,6 +360,10 @@ func (t *transport) queueAction(name string, a fields) (fields, *fault) {
 		i, ok := index("Index")
 		if !ok {
 			return nil, invalid
+		}
+		if q.isShuffle() {
+			q.index = i
+			q.rebuildOrder()
 		}
 		return nil, t.selectTrack(i, "PLAYING")
 	case "RemoveTracksInQueue":

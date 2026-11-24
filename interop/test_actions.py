@@ -20,7 +20,13 @@ class ActionTests(PeerTest):
     async def test_connection_manager(self):
         protocols = await self.cp.call(CM, 'GetProtocolInfo')
         self.assertEqual(protocols['Source'], '')
-        self.assertIn('http-get:*:audio/flac:*', protocols['Sink'].split(','))
+        sinks = set(protocols['Sink'].split(','))
+        for mime in ('audio/flac', 'audio/x-flac', 'audio/wav', 'audio/aiff', 'audio/mpeg',
+                     'audio/aac', 'audio/mp4', 'audio/x-m4a', 'audio/alac', 'audio/ogg',
+                     'audio/opus', 'audio/webm', 'audio/dsf', 'audio/wavpack', 'audio/x-ape',
+                     'audio/x-ms-wma'):
+            self.assertIn(f'http-get:*:{mime}:*', sinks)
+        self.assertNotIn('http-get:*:audio/L16:*', sinks)
         ids = await self.cp.call(CM, 'GetCurrentConnectionIDs')
         self.assertEqual(ids['ConnectionIDs'], '0')
         connection = await self.cp.call(CM, 'GetCurrentConnectionInfo', ConnectionID=0)
@@ -84,6 +90,13 @@ class ActionTests(PeerTest):
         await pq('AppendTracksInQueue', QueueContext=playlist('CurrentQueue', [(uri, last)]))
         await pq('PlayQueueWithIndex', QueueName='named', Index=2)
         await self.playing()
+        await pq('SetQueueLoopMode', LoopMode=2)
+        self.assertEqual((await self.av('GetTransportSettings'))['PlayMode'], 'SHUFFLE')
+        self.assertEqual((await pq('GetQueueLoopMode'))['LoopMode'], 2)
+        await pq('SetQueueLoopMode', LoopMode=3)
+        self.assertEqual((await self.av('GetTransportSettings'))['PlayMode'], 'SHUFFLE_NOREPEAT')
+        await pq('SetQueueLoopMode', LoopMode=5)
+        self.assertEqual((await self.av('GetTransportSettings'))['PlayMode'], 'SHUFFLE_REPEAT_ONE')
         await pq('SetQueueLoopMode', LoopMode=1)
         self.assertEqual((await self.av('GetTransportSettings'))['PlayMode'], 'REPEAT_ONE')
         await pq('MoveTracksInQueue', **current, IndexList='2', ToIndex=1)

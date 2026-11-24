@@ -102,6 +102,7 @@ func (t *transport) refresh() {
 					// to the sole current track and clears Previous/NextURI.
 					t.q.items = []track{t.q.items[i]}
 					t.q.index = 0
+					t.q.rebuildOrder()
 				} else {
 					t.q.index = i
 				}

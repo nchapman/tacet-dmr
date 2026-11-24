@@ -13,8 +13,34 @@ const (
 	rc         = "RenderingControl"
 	cm         = "ConnectionManager"
 	pq         = "PlayQueue"
-	protocols  = "http-get:*:audio/flac:*,http-get:*:audio/wav:*,http-get:*:audio/mpeg:*,http-get:*:audio/aac:*,http-get:*:audio/mp4:*,http-get:*:audio/ogg:*"
 )
+
+// Containerized audio MIME types natively demuxed and decoded by embedded
+// libmpv (FFmpeg lavf/lavc). Headerless raw PCM (audio/L16) is omitted because
+// libmpv cannot infer sample format without out-of-band flags. DSD (.dsf) is
+// decoded to PCM by libmpv rather than passed through as native DSD/DoP.
+var sinkMIMEs = []string{
+	"audio/flac", "audio/x-flac",
+	"audio/wav", "audio/x-wav",
+	"audio/aiff", "audio/x-aiff",
+	"audio/mpeg",
+	"audio/aac",
+	"audio/mp4", "audio/x-m4a", "audio/alac",
+	"audio/ogg", "application/ogg", "audio/opus",
+	"audio/webm", "audio/x-matroska",
+	"audio/dsf", "audio/x-dsf",
+	"audio/wavpack", "audio/x-wavpack",
+	"audio/x-ape",
+	"audio/x-ms-wma",
+}
+
+var protocols = func() string {
+	entries := make([]string, len(sinkMIMEs))
+	for i, m := range sinkMIMEs {
+		entries[i] = "http-get:*:" + m + ":*"
+	}
+	return strings.Join(entries, ",")
+}()
 
 var services = []string{av, rc, cm, pq}
 

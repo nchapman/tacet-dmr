@@ -22,14 +22,14 @@ Use the printed address. Tacet's URL validator requires a private LAN IP, **even
 
 ## What works in renderer mode
 
-- **AVTransport:1**: set/clear an HTTP(S) track and its next URI with DIDL metadata; play, pause, stop, time seek, next and previous. Query media, position, available transport actions, and play mode. `SetPlayMode` accepts `NORMAL`, `REPEAT_ONE` and `REPEAT_ALL`. Playback errors are reported via `TransportStatus`; seek depends on a seekable source.
+- **AVTransport:1**: set/clear an HTTP(S) track and its next URI with DIDL metadata; play, pause, stop, time seek, next and previous. Query media, position, available transport actions, and play mode. `SetPlayMode` accepts `NORMAL`, `REPEAT_ONE`, `REPEAT_ALL`, `SHUFFLE`, `SHUFFLE_NOREPEAT`, and `SHUFFLE_REPEAT_ONE`. Playback errors are reported via `TransportStatus`; seek depends on a seekable source.
 - **RenderingControl:1**: volume (0–100) and mute on `Master`. By default, libmpv handles volume and mute in software (starting at 30 with `-exclusive`, 100 otherwise, or an explicit `-volume 0..100`). On macOS exclusive CoreAudio outputs (`coreaudio/<UID>` with `-exclusive`, or `coreaudio_exclusive/<UID>`), mpv's exclusive driver does not expose `ao-volume`, so `tacet-dmr` uses the device's CoreAudio hardware volume (and hardware mute when supported) directly while keeping libmpv at unity software gain (100). Hardware-controlled devices preserve their current level at startup unless `-volume` is given, reflect external OS/device volume changes via GENA `LastChange`, attach automatically if a USB DAC is plugged in after startup (and reconnect across unplug/replug by device UID), and fall back to libmpv software volume when the device has no writable hardware control. `FactoryDefaults` restores the startup level and unmutes; track changes and Stop/Play retain the current setting.
-- **ConnectionManager:1**: sink protocol and static connection information. Conservative HTTP audio MIME list; no native DSD claim.
+- **ConnectionManager:1**: sink protocol and static connection information advertising the containerized HTTP audio MIME types natively decoded by embedded libmpv (FLAC, WAV, AIFF, MP3, AAC, MP4/M4A/ALAC, Ogg/Opus, WebM/Matroska, DSF, WavPack, APE, WMA). Headerless `audio/L16` is omitted; DSF is software-decoded to PCM by libmpv (no native DSD/DoP claim).
 - **GENA**: subscribe, initial notification, subsequent state changes, renewal and unsubscribe. Position is polled rather than pushed every second.
 
 ## Native queue and track transitions
 
-Tacet detects `urn:schemas-wiimu-com:service:PlayQueue:1` in the device description and switches to its native queue controller. It sends a named list, appending batches for long queues. The renderer owns one in-memory queue, advances on natural EOF without waiting for Tacet, and reports its current index even when two entries have the same URL. Tacet owns shuffle order. These are the wire actions implemented:
+Tacet detects `urn:schemas-wiimu-com:service:PlayQueue:1` in the device description and switches to its native queue controller. It sends a named list, appending batches for long queues. The renderer owns one in-memory queue, advances on natural EOF without waiting for Tacet, and reports its current index even when two entries have the same URL. These are the wire actions implemented:
 
 | PlayQueue action | Behavior |
 | --- | --- |
@@ -37,7 +37,7 @@ Tacet detects `urn:schemas-wiimu-com:service:PlayQueue:1` in the device descript
 | `PlayQueueWithIndex`, `GetQueueIndex` | Play or report a one-based index by list name or `CurrentQueue`. An empty list reports 0. |
 | `MoveTracksInQueue`, `RemoveTracksInQueue` | Move one entry or remove a one-based inclusive range. Reordering or deleting other entries preserves current playback. Removing the current entry stops it and selects its successor, or the last remaining entry; Tacet explicitly plays its chosen replacement. |
 | `BrowseQueue` | `CurrentQueue` or the list name returns a `PlayList` with ordered `Track1`…`TrackN`, URL and escaped DIDL. `TotalQueue` is reserved for the inventory (zero or one named list). |
-| `SetQueueLoopMode`, `GetQueueLoopMode` | `0` repeats all, `1` repeats one, `4` stops at the end. Manual Next/Previous ignore repeat-one. Playback errors stop instead of starting a repeat loop. |
+| `SetQueueLoopMode`, `GetQueueLoopMode` | `0` repeats all, `1` repeats one, `2` shuffles and repeats all, `3` shuffles without repeat, `4` plays sequentially and stops at the end, `5` shuffles with repeat-one. Manual Next/Previous walk the active playback order and ignore repeat-one. Playback errors stop instead of starting a repeat loop. |
 
 A normal UPnP controller can use `SetAVTransportURI` to replace the native queue and `SetNextAVTransportURI` to set, replace or clear the following track. Setting just the next URI while a named queue is active returns a transport fault rather than discarding the queue. Stop preserves the selection; process restart clears it.
 

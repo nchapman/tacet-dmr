@@ -112,6 +112,11 @@ func (r *queueRig) jump(n string) {
 	r.call(pq, "PlayQueueWithIndex", fields{"Index": n, "QueueName": currentQueue})
 	r.tpt.refresh()
 }
+func (r *queueRig) eof() {
+	r.Helper()
+	r.player.eof()
+	r.tpt.refresh()
+}
 func (r *queueRig) check(index int, uri, state string) {
 	r.Helper()
 	i := r.call(pq, "GetQueueIndex", fields{"QueueName": currentQueue})["CurrentIndex"]
@@ -199,7 +204,7 @@ func TestInvalidQueueRequestsPreservePlayback(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args fields
-	}{{"CreateQueue", fields{"QueueContext": bad}}, {"AppendTracksInQueue", fields{"QueueContext": ctxXML("wrong", a)}}, {"AppendTracksInQueue", fields{"QueueContext": strings.Replace(ctxXML(currentQueue, a), "Track1>", "Track3>", -1)}}, {"CreateQueue", fields{"QueueContext": strings.Replace(ctxXML("tacet", a), "<TrackNumber>1", "<TrackNumber>20", 1)}}, {"PlayQueueWithIndex", fields{"QueueName": currentQueue, "Index": "0"}}, {"RemoveTracksInQueue", fields{"QueueName": "tacet", "RangStart": "1", "RangEnd": "2", "Action": "0"}}, {"MoveTracksInQueue", fields{"QueueName": currentQueue, "IndexList": "1,2", "ToIndex": "1"}}, {"SetQueueLoopMode", fields{"LoopMode": "3"}}} {
+	}{{"CreateQueue", fields{"QueueContext": bad}}, {"AppendTracksInQueue", fields{"QueueContext": ctxXML("wrong", a)}}, {"AppendTracksInQueue", fields{"QueueContext": strings.Replace(ctxXML(currentQueue, a), "Track1>", "Track3>", -1)}}, {"CreateQueue", fields{"QueueContext": strings.Replace(ctxXML("tacet", a), "<TrackNumber>1", "<TrackNumber>20", 1)}}, {"PlayQueueWithIndex", fields{"QueueName": currentQueue, "Index": "0"}}, {"RemoveTracksInQueue", fields{"QueueName": "tacet", "RangStart": "1", "RangEnd": "2", "Action": "0"}}, {"MoveTracksInQueue", fields{"QueueName": currentQueue, "IndexList": "1,2", "ToIndex": "1"}}, {"SetQueueLoopMode", fields{"LoopMode": "6"}}} {
 		if _, f := r.tpt.call(pq, tc.name, tc.args); f == nil {
 			t.Fatalf("accepted %s", tc.name)
 		}
@@ -229,5 +234,93 @@ func TestGenericNextReplaceClearAndResetNativeQueue(t *testing.T) {
 	}
 	if _, f := r.tpt.call(av, "Next", fields{"InstanceID": "0"}); f == nil {
 		t.Fatal("Next succeeded after clearing next URI")
+	}
+}
+
+func TestShuffleLoopModesAndQueueEdits(t *testing.T) {
+	const a, b, c, d, e = "http://media/a", "http://media/b", "http://media/c", "http://media/d", "http://media/e"
+	r := setupQueue(t)
+	// Reverse the tail deterministically so shuffle order is predictable.
+	r.tpt.q.shuffle = func(n int, swap func(i, j int)) {
+		for i, j := 0, n-1; i < j; i, j = i+1, j-1 {
+			swap(i, j)
+		}
+	}
+	r.create(a, b, c, d)
+	r.jump("2") // start on b (index 1); tail [a(0), c(2), d(3)] reversed -> order [1(b), 3(d), 2(c), 0(a)]
+
+	// Mode 3: SHUFFLE_NOREPEAT plays every track once in shuffled order, then stops.
+	r.call(pq, "SetQueueLoopMode", fields{"LoopMode": "3"})
+	if got := r.call(av, "GetTransportSettings", nil)["PlayMode"]; got != "SHUFFLE_NOREPEAT" {
+		t.Fatalf("PlayMode = %q", got)
+	}
+	if idx := r.call(pq, "GetQueueIndex", fields{"QueueName": currentQueue}); idx["CurrentIndex"] != "2" || idx["PreloadingIndex"] != "4" {
+		t.Fatalf("shuffled lookahead mismatch: %+v", idx)
+	}
+	// Advance b -> d -> c -> a; then Previous goes back to c; then Next returns to a; then EOF stops.
+	r.eof()
+	r.check(4, d, "PLAYING")
+	r.eof()
+	r.check(3, c, "PLAYING")
+	r.eof()
+	r.check(1, a, "PLAYING")
+	r.call(av, "Previous", nil)
+	r.tpt.refresh()
+	r.check(3, c, "PLAYING")
+	r.call(av, "Next", nil)
+	r.tpt.refresh()
+	r.check(1, a, "PLAYING")
+	r.eof()
+	r.check(1, a, "STOPPED")
+
+	// Mode 2: SHUFFLE (repeat all) wraps after the last shuffled track.
+	r.call(pq, "SetQueueLoopMode", fields{"LoopMode": "2"})
+	if got := r.call(av, "GetTransportSettings", nil)["PlayMode"]; got != "SHUFFLE" {
+		t.Fatalf("PlayMode = %q", got)
+	}
+	r.jump("2") // restarts shuffle with b at order[0] -> [1(b), 3(d), 2(c), 0(a)]
+	for _, want := range []struct {
+		idx int
+		uri string
+	}{{4, d}, {3, c}, {1, a}, {2, b}} {
+		r.eof()
+		r.check(want.idx, want.uri, "PLAYING")
+	}
+
+	// Mode 5: SHUFFLE_REPEAT_ONE repeats current track at EOF, while manual Next uses shuffle order.
+	r.call(pq, "SetQueueLoopMode", fields{"LoopMode": "5"})
+	if got := r.call(av, "GetTransportSettings", nil)["PlayMode"]; got != "SHUFFLE_REPEAT_ONE" {
+		t.Fatalf("PlayMode = %q", got)
+	}
+	if got := r.call(pq, "GetQueueLoopMode", nil)["LoopMode"]; got != "5" {
+		t.Fatalf("LoopMode = %q", got)
+	}
+	r.eof()
+	r.check(2, b, "PLAYING")
+	r.call(av, "Next", nil)
+	r.tpt.refresh()
+	r.check(4, d, "PLAYING")
+
+	// Queue edits (Append, Move, Remove) while shuffled keep valid indices and preserve playback.
+	r.call(pq, "SetQueueLoopMode", fields{"LoopMode": "3"})
+	r.call(pq, "AppendTracksInQueue", fields{"QueueContext": ctxXML(currentQueue, e)})
+	r.call(pq, "MoveTracksInQueue", fields{"QueueName": currentQueue, "IndexList": "4", "ToIndex": "1"}) // d moves 4 -> 1
+	r.check(1, d, "PLAYING")
+	r.call(pq, "RemoveTracksInQueue", fields{"QueueName": currentQueue, "RangStart": "2", "RangEnd": "2", "Action": "0"}) // remove a
+	r.check(1, d, "PLAYING")
+	// Remaining unplayed tracks after d are e and c (b already played earlier in the pass; a was removed).
+	r.eof()
+	r.check(4, e, "PLAYING")
+	r.eof()
+	r.check(3, c, "PLAYING")
+	r.eof()
+	r.check(3, c, "STOPPED")
+
+	// SetPlayMode round-trips back to GetQueueLoopMode for all 6 LinkPlay modes.
+	for mode, code := range loopCodes {
+		r.call(av, "SetPlayMode", fields{"NewPlayMode": mode})
+		if got := r.call(pq, "GetQueueLoopMode", nil)["LoopMode"]; got != code {
+			t.Fatalf("SetPlayMode(%s) -> GetQueueLoopMode = %q, want %q", mode, got, code)
+		}
 	}
 }
