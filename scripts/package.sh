@@ -18,7 +18,7 @@ for os in darwin linux windows; do
         bin=tacet-dmr
         if [ "$os" = windows ]; then bin=tacet-dmr.exe; fi
         CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -tags nocgo -trimpath -ldflags="-s -w -X main.version=${version}" -o "$dir/$bin" ./cmd/tacet-dmr
-        cp README.md "$dir/"
+        cp LICENSE README.md "$dir/"
         cp -R docs "$dir/"
         if [ "$os" = windows ]; then
             (cd "$tmp" && zip -qr "assets/$name.zip" "$name")
