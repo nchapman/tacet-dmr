@@ -30,6 +30,40 @@ func main() {
 	}
 }
 
+var openVolumeControl = mpvplayer.OpenVolumeControl
+
+func configureLocalVolume(setSoft func(int) error, vol playback.VolumeControl, initial *int, exclusive bool) error {
+	if vol != nil {
+		if initial != nil {
+			if err := vol.SetVolume(*initial); err != nil {
+				return fmt.Errorf("set initial volume: %w", err)
+			}
+		}
+		if err := setSoft(100); err != nil {
+			return fmt.Errorf("set software gain: %w", err)
+		}
+		return nil
+	}
+	level := 100
+	if initial != nil {
+		level = *initial
+	} else if exclusive {
+		level = 30
+	}
+	if err := setSoft(level); err != nil {
+		return fmt.Errorf("set initial volume: %w", err)
+	}
+	return nil
+}
+
+func configureServerVolume(c *renderer.Config, vol playback.VolumeControl, exclusive bool) {
+	c.Volume = vol
+	if exclusive && c.Volume == nil && c.InitialVolume == nil {
+		level := 30
+		c.InitialVolume = &level
+	}
+}
+
 func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error {
 	fs := flag.NewFlagSet("tacet-dmr", flag.ContinueOnError)
 	list := fs.Bool("list-devices", false, "list audio output device IDs and exit")
@@ -37,7 +71,7 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 	excl := fs.Bool("exclusive", false, "request exclusive audio on a named native device")
 	interactive := fs.Bool("interactive", false, "read play/pause/seek/status/stop commands from stdin")
 	var server renderer.Config
-	fs.Func("volume", "initial software volume, 0–100 (default: 30 exclusive, 100 shared)", func(raw string) error {
+	fs.Func("volume", "initial volume, 0–100 (default: device level when hardware-controlled, 30 exclusive software, 100 shared)", func(raw string) error {
 		v, err := strconv.Atoi(raw)
 		if err != nil || v < 0 || v > 100 {
 			return errors.New("volume must be an integer from 0 to 100")
@@ -57,14 +91,11 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *excl && server.InitialVolume == nil {
-		level := 30
-		server.InitialVolume = &level
-	}
 	if server.Listen != "" {
 		if *list || *interactive || fs.NArg() != 0 {
 			return errors.New("-serve cannot be combined with local tracks, -interactive or -list-devices")
 		}
+		configureServerVolume(&server, openVolumeControl(*device, *excl), *excl)
 		return renderer.Serve(ctx, server, func() (renderer.Engine, error) { return mpvplayer.OpenNetwork(*device, *excl) }, out)
 	}
 	if *list && fs.NArg() != 0 {
@@ -97,8 +128,8 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 		}
 		return nil
 	}
-	if err := p.SetVolume(server.StartupVolume()); err != nil {
-		return fmt.Errorf("set initial volume: %w", err)
+	if err := configureLocalVolume(p.SetVolume, openVolumeControl(*device, *excl), server.InitialVolume, *excl); err != nil {
+		return err
 	}
 	var commands <-chan string
 	if *interactive {

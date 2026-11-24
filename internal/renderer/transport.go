@@ -37,6 +37,7 @@ var failed = &fault{501, "Action Failed"}
 type transport struct {
 	open                  Factory
 	p                     Engine
+	vol                   playback.VolumeControl // nil: mpv handles volume and mute (default)
 	active                int64
 	next                  stagedEntry
 	ended                 bool // natural EOF received, waiting for successor to become playable
@@ -44,11 +45,60 @@ type transport struct {
 	state, status         string
 	pos, duration         time.Duration
 	volume, initialVolume int
-	mute                  bool
+	mute, hwMute          bool
 }
 
-func newTransport(open Factory, initialVolume int) *transport {
-	return &transport{open: open, q: playlist{mode: normal}, state: "NO_MEDIA_PRESENT", status: "OK", volume: initialVolume, initialVolume: initialVolume}
+func clampVolume(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+func newTransport(open Factory, initialVolume *int, vol playback.VolumeControl) *transport {
+	v := 100
+	if initialVolume != nil {
+		v = clampVolume(*initialVolume)
+	}
+	t := &transport{
+		open:          open,
+		vol:           vol,
+		q:             playlist{mode: normal},
+		state:         "NO_MEDIA_PRESENT",
+		status:        "OK",
+		volume:        v,
+		initialVolume: v,
+	}
+	if vol != nil {
+		if hwVol, err := vol.Volume(); err == nil {
+			t.volume = clampVolume(hwVol)
+			if initialVolume == nil {
+				t.initialVolume = t.volume
+			}
+		}
+		if hwMute, err := vol.Mute(); err == nil {
+			t.hwMute = true
+			t.mute = hwMute
+		}
+	}
+	return t
+}
+
+func (t *transport) syncVolume() {
+	if t.vol == nil {
+		return
+	}
+	if v, err := t.vol.Volume(); err == nil {
+		t.volume = clampVolume(v)
+	}
+	if t.hwMute {
+		if m, err := t.vol.Mute(); err == nil {
+			t.mute = m
+		}
+	}
 }
 func (t *transport) release() {
 	if t.p != nil {
@@ -102,8 +152,21 @@ func (t *transport) openTrack(paused bool) error {
 		return err
 	}
 	t.p = p
-	if err = p.SetVolume(t.volume); err == nil {
-		err = p.SetMute(t.mute)
+	if t.vol != nil {
+		// Platform hardware volume controls the output level; keep mpv at
+		// unity software gain so samples are not double-attenuated.
+		err = p.SetVolume(100)
+		if err == nil {
+			if t.hwMute {
+				err = p.SetMute(false)
+			} else {
+				err = p.SetMute(t.mute)
+			}
+		}
+	} else {
+		if err = p.SetVolume(t.volume); err == nil {
+			err = p.SetMute(t.mute)
+		}
 	}
 	if err == nil {
 		err = p.Pause(true)
@@ -298,27 +361,51 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 	case "GetTransportSettings":
 		return fields{"PlayMode": t.q.mode, "RecQualityMode": "NOT_IMPLEMENTED"}, nil
 	case "GetVolume":
+		t.syncVolume()
 		return fields{"CurrentVolume": strconv.Itoa(t.volume)}, nil
 	case "SetVolume":
 		v, err := strconv.Atoi(a["DesiredVolume"])
 		if err != nil || v < 0 || v > 100 {
 			return nil, invalid
 		}
-		if t.p != nil && t.p.SetVolume(v) != nil {
-			return nil, failed
+		if t.vol != nil {
+			if t.vol.SetVolume(v) != nil {
+				return nil, failed
+			}
+			if actual, err := t.vol.Volume(); err == nil {
+				t.volume = clampVolume(actual)
+			} else {
+				t.volume = v
+			}
+		} else {
+			if t.p != nil && t.p.SetVolume(v) != nil {
+				return nil, failed
+			}
+			t.volume = v
 		}
-		t.volume = v
 	case "GetMute":
+		t.syncVolume()
 		return fields{"CurrentMute": onOff(t.mute)}, nil
 	case "SetMute":
 		v, err := strconv.ParseBool(a["DesiredMute"])
 		if err != nil {
 			return nil, invalid
 		}
-		if t.p != nil && t.p.SetMute(v) != nil {
-			return nil, failed
+		if t.vol != nil && t.hwMute {
+			if t.vol.SetMute(v) != nil {
+				return nil, failed
+			}
+			if actual, err := t.vol.Mute(); err == nil {
+				t.mute = actual
+			} else {
+				t.mute = v
+			}
+		} else {
+			if t.p != nil && t.p.SetMute(v) != nil {
+				return nil, failed
+			}
+			t.mute = v
 		}
-		t.mute = v
 	case "ListPresets":
 		return fields{"CurrentPresetNameList": "FactoryDefaults"}, nil
 	case "SelectPreset":

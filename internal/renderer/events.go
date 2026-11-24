@@ -140,6 +140,7 @@ func (d *Device) subscription(w http.ResponseWriter, r *http.Request, service st
 		w.Header().Set("TIMEOUT", fmt.Sprintf("Second-%d", sec))
 		w.WriteHeader(200)
 		_ = http.NewResponseController(w).Flush()
+		d.t.syncVolume()
 		d.wg.Add(1)
 		go d.notify(ctx, sub, d.t.eventState())
 		return

@@ -14,12 +14,14 @@ import (
 
 	"github.com/google/uuid"
 	ssdp "github.com/koron/go-ssdp"
+	"github.com/nchapman/tacet-dmr/internal/playback"
 )
 
 type Config struct {
 	Listen, Controller, Name, UUID string
 	NoSSDP                         bool
-	InitialVolume                  *int // nil preserves unity gain for shared playback
+	InitialVolume                  *int                   // nil: 100 for mpv software volume, or current device level when Volume is set
+	Volume                         playback.VolumeControl // nil: mpv handles volume and mute (default)
 }
 
 func (c Config) StartupVolume() int {
@@ -152,6 +154,11 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if c.InitialVolume != nil && c.Volume != nil {
+		if err := c.Volume.SetVolume(*c.InitialVolume); err != nil {
+			return fmt.Errorf("set initial volume: %w", err)
+		}
+	}
 	ln, err := net.Listen("tcp4", ap.String())
 	if err != nil {
 		return err
@@ -159,7 +166,7 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	defer ln.Close()
 	host := ln.Addr().String()
 	location := "http://" + host + "/description.xml"
-	d := New(c.Name, udn, host, peers, volume, open)
+	d := newDevice(c.Name, udn, host, peers, c.InitialVolume, c.Volume, open)
 	defer d.Close()
 	srv := &http.Server{Handler: d, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 8 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 16 << 10}
 	defer srv.Close()
@@ -173,7 +180,11 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 		}
 		defer ads.close()
 	}
-	fmt.Fprintf(out, "%s (%s)\nTACET_RENDERER_URL=%s\nController: %s · SSDP enabled: %t\n", c.Name, udn, location, peers, !c.NoSSDP)
+	volumeBackend := "mpv software"
+	if c.Volume != nil {
+		volumeBackend = fmt.Sprint(c.Volume)
+	}
+	fmt.Fprintf(out, "%s (%s)\nTACET_RENDERER_URL=%s\nController: %s · SSDP enabled: %t · Volume: %s\n", c.Name, udn, location, peers, !c.NoSSDP, volumeBackend)
 	tick := time.NewTicker(12 * time.Minute)
 	defer tick.Stop()
 	for {

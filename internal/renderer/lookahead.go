@@ -50,6 +50,7 @@ func (t *transport) finish() {
 }
 
 func (t *transport) refresh() {
+	t.syncVolume()
 	// Bound work under the service lock even for pathological, tiny repeat loops.
 	for n := 0; t.p != nil && n < 128; n++ {
 		ev, err := t.p.NextNotice(0)

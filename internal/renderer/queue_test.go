@@ -78,7 +78,7 @@ type queueRig struct {
 
 func setupQueue(t *testing.T) *queueRig {
 	r := &queueRig{T: t}
-	r.tpt = newTransport(func() (Engine, error) { r.player = &queueEngine{entries: make(map[int64]string)}; return r.player, nil }, 100)
+	r.tpt = newTransport(func() (Engine, error) { r.player = &queueEngine{entries: make(map[int64]string)}; return r.player, nil }, nil, nil)
 	return r
 }
 func (r *queueRig) call(s, action string, a fields) fields {

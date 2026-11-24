@@ -11,6 +11,23 @@ import (
 // enqueue errors leave ownership uncertain and the session must be retired.
 var ErrNotQueued = errors.New("entry was not queued")
 
+// ErrUnsupported reports that a volume controller does not expose a given
+// control (for example, a DAC with hardware volume but no hardware mute).
+var ErrUnsupported = errors.New("control not supported")
+
+// VolumeControl overrides the playback engine's default software volume and
+// mute controls for a specific output target (for example, macOS CoreAudio
+// hardware device controls during exclusive playback).
+//
+// Mute and SetMute may return ErrUnsupported, in which case the caller falls
+// back to the playback engine's software mute while keeping hardware volume.
+type VolumeControl interface {
+	Volume() (int, error)
+	SetVolume(int) error
+	Mute() (bool, error)
+	SetMute(bool) error
+}
+
 type Device struct{ ID, Description string }
 
 type Status struct {
