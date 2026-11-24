@@ -28,7 +28,7 @@ func TestGENALifecycle(t *testing.T) {
 	}))
 	defer cb.Close()
 	srv := httptest.NewUnstartedServer(nil)
-	d := New("Desk", "uuid:test", srv.Listener.Addr().String(), netip.MustParseAddr("127.0.0.1"), nil)
+	d := New("Desk", "uuid:test", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.0/24"), nil)
 	defer d.Close()
 	srv.Config.Handler = d
 	srv.Start()
@@ -67,6 +67,29 @@ func TestGENALifecycle(t *testing.T) {
 		}
 	}
 	expect("0", `<Volume channel="Master" val="100"`)
+	// Another allowed controller can read the description, but cannot target
+	// the first controller's callback or claim its subscription by SID.
+	for _, tc := range []struct {
+		method, path string
+		headers      map[string]string
+		code         int
+	}{
+		{"GET", "/description.xml", nil, 200},
+		{"SUBSCRIBE", path, map[string]string{"SID": sid}, 412},
+		{"UNSUBSCRIBE", path, map[string]string{"SID": sid}, 412},
+		{"SUBSCRIBE", path, map[string]string{"NT": "upnp:event", "CALLBACK": "<" + cb.URL + ">"}, 412},
+	} {
+		r := httptest.NewRequest(tc.method, srv.URL+tc.path, nil)
+		r.RemoteAddr = "127.0.0.2:1234"
+		for k, v := range tc.headers {
+			r.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		d.ServeHTTP(w, r)
+		if w.Code != tc.code {
+			t.Fatalf("second peer %s %s: %d", tc.method, tc.path, w.Code)
+		}
+	}
 	r = request("SUBSCRIBE", path, map[string]string{"SID": sid, "TIMEOUT": "Second-80"}, "")
 	if r.Get("SID") != sid || r.Get("Timeout") != "Second-80" {
 		t.Fatal(r)
@@ -89,7 +112,7 @@ func TestGENALifecycle(t *testing.T) {
 }
 
 func TestDeviceAcceptsOnlyConfiguredControllerAndHost(t *testing.T) {
-	d := New("Desk", "uuid:test", "192.168.1.12:8088", netip.MustParseAddr("192.168.1.42"), nil)
+	d := New("Desk", "uuid:test", "192.168.1.12:8088", netip.MustParsePrefix("192.168.1.42/32"), nil)
 	defer d.Close()
 	for _, tc := range []struct {
 		remote, host, origin string

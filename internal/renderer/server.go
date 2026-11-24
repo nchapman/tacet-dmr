@@ -24,6 +24,23 @@ type Config struct {
 func lan(ip netip.Addr) bool {
 	return ip.Is4() && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast())
 }
+
+// A bare IP keeps the original single-controller policy. Require an explicit
+// network address and keep the entire prefix inside one LAN address range.
+func controllerNetwork(raw string) (netip.Prefix, error) {
+	if ip, err := netip.ParseAddr(raw); err == nil && lan(ip) {
+		return netip.PrefixFrom(ip, 32), nil
+	}
+	if p, err := netip.ParsePrefix(raw); err == nil && p == p.Masked() {
+		for _, block := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8"} {
+			local := netip.MustParsePrefix(block)
+			if p.Bits() >= local.Bits() && local.Contains(p.Addr()) {
+				return p, nil
+			}
+		}
+	}
+	return netip.Prefix{}, errors.New("-controller requires a LAN IPv4 address or trusted LAN subnet such as 192.168.1.0/24")
+}
 func identity(id string) (string, error) {
 	if id != "" {
 		u, err := uuid.Parse(id)
@@ -112,9 +129,9 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	if err != nil || !lan(ap.Addr()) {
 		return errors.New("-serve requires a concrete private, link-local or loopback IPv4:port, not a wildcard")
 	}
-	peer, err := netip.ParseAddr(c.Controller)
-	if err != nil || !lan(peer) {
-		return errors.New("-controller requires the trusted Tacet server's LAN IPv4 address")
+	peers, err := controllerNetwork(c.Controller)
+	if err != nil {
+		return err
 	}
 	if c.Name == "" {
 		return errors.New("renderer name cannot be empty")
@@ -130,7 +147,7 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	defer ln.Close()
 	host := ln.Addr().String()
 	location := "http://" + host + "/description.xml"
-	d := New(c.Name, udn, host, peer, open)
+	d := New(c.Name, udn, host, peers, open)
 	defer d.Close()
 	srv := &http.Server{Handler: d, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 8 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 16 << 10}
 	defer srv.Close()
@@ -144,7 +161,7 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 		}
 		defer ads.close()
 	}
-	fmt.Fprintf(out, "%s (%s)\nTACET_RENDERER_URL=%s\nController: %s · SSDP enabled: %t\n", c.Name, udn, location, peer, !c.NoSSDP)
+	fmt.Fprintf(out, "%s (%s)\nTACET_RENDERER_URL=%s\nController: %s · SSDP enabled: %t\n", c.Name, udn, location, peers, !c.NoSSDP)
 	tick := time.NewTicker(12 * time.Minute)
 	defer tick.Stop()
 	for {

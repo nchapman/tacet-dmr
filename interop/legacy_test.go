@@ -16,7 +16,7 @@ import (
 // newer fields, and does not consult our service description for their types.
 func TestGeneratedWiiMQueueClient(t *testing.T) {
 	srv := httptest.NewUnstartedServer(nil)
-	dev := renderer.New("Fixture", "uuid:test", srv.Listener.Addr().String(), netip.MustParseAddr("127.0.0.1"), nil)
+	dev := renderer.New("Fixture", "uuid:test", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.1/32"), nil)
 	defer dev.Close()
 	srv.Config.Handler = dev
 	srv.Start()

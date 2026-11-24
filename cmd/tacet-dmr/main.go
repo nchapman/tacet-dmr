@@ -37,7 +37,7 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 	interactive := fs.Bool("interactive", false, "read play/pause/seek/status/stop commands from stdin")
 	var server renderer.Config
 	fs.StringVar(&server.Listen, "serve", "", "host a UPnP renderer on this LAN IPv4:port")
-	fs.StringVar(&server.Controller, "controller", "", "trusted Tacet server IPv4 (required with -serve)")
+	fs.StringVar(&server.Controller, "controller", "", "trusted controller IPv4 or LAN CIDR, e.g. 192.168.1.0/24 (required with -serve)")
 	fs.StringVar(&server.Name, "name", "Tacet Renderer", "UPnP friendly name")
 	fs.StringVar(&server.UUID, "uuid", "", "override stable renderer UUID (default: derived from hostname)")
 	fs.BoolVar(&server.NoSSDP, "no-ssdp", false, "disable multicast discovery; use the printed description URL")

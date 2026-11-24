@@ -15,7 +15,7 @@ const soapNS = "http://schemas.xmlsoap.org/soap/envelope/"
 
 type Device struct {
 	host   string
-	peer   netip.Addr
+	peers  netip.Prefix
 	mux    *http.ServeMux
 	mu     sync.Mutex // owns the transport, its libmpv handle, and subscription registry
 	t      *transport
@@ -27,8 +27,8 @@ type Device struct {
 	closed bool
 }
 
-func New(name, udn, host string, peer netip.Addr, open Factory) *Device {
-	d := &Device{host: host, peer: peer.Unmap(), mux: http.NewServeMux(), t: newTransport(open), subs: make(map[string]*subscription), done: make(chan struct{}), client: &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+func New(name, udn, host string, peers netip.Prefix, open Factory) *Device {
+	d := &Device{host: host, peers: peers, mux: http.NewServeMux(), t: newTransport(open), subs: make(map[string]*subscription), done: make(chan struct{}), client: &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	document := func(path, body string) {
 		d.mux.HandleFunc("GET "+path, func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", `text/xml; charset="utf-8"`)
@@ -92,9 +92,12 @@ func (d *Device) Close() {
 	d.mu.Unlock()
 	d.wg.Wait()
 }
+func requestPeer(r *http.Request) netip.Addr {
+	ap, _ := netip.ParseAddrPort(r.RemoteAddr)
+	return ap.Addr().Unmap() // invalid on parse error; never matches a prefix
+}
 func (d *Device) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ap, err := netip.ParseAddrPort(r.RemoteAddr)
-	if err != nil || ap.Addr().Unmap() != d.peer || r.Host != d.host || r.Header.Get("Origin") != "" {
+	if !d.peers.Contains(requestPeer(r)) || r.Host != d.host || r.Header.Get("Origin") != "" {
 		http.Error(w, "not an allowed controller", http.StatusForbidden)
 		return
 	}

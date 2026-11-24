@@ -10,7 +10,7 @@ Download the archive for your OS and CPU from [Releases](https://github.com/ncha
 - **Linux:** `linux-amd64` or `linux-arm64` for glibc-based systems. Ubuntu 26.04 provides `libmpv2`.
 - **Windows:** `windows-amd64` or `windows-arm64`. Put the matching libmpv DLL and its dependencies next to `tacet-dmr.exe`.
 
-On the renderer machine, replace **both example addresses** with your own: `-serve` binds to the renderer’s LAN IPv4 address, and `-controller` allows only the Tacet server’s IPv4 address.
+On the renderer machine, replace **both example addresses** with your own: `-serve` binds to the renderer’s LAN IPv4 address, and `-controller` allows the Tacet server’s IPv4 address. On `main` you can instead pass a trusted LAN subnet, e.g. `-controller 192.168.1.0/24`, to let any host on that subnet control playback.
 
 ```sh
 ./tacet-dmr -list-devices

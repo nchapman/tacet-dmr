@@ -1,6 +1,6 @@
 # Use tacet-dmr from Tacet
 
-Renderer mode exposes one audio output to **one trusted Tacet server** over IPv4. It is opt-in: running with a file argument still starts only the local player. [Build and native runtime setup](playback.md).
+Renderer mode exposes one audio output to **a trusted Tacet server or LAN subnet** over IPv4. It is opt-in: running with a file argument still starts only the local player. [Build and native runtime setup](playback.md).
 
 For example, if the **renderer** is `192.168.1.32` and the **Tacet server** is `192.168.1.10`, start this on the renderer:
 
@@ -16,7 +16,7 @@ Select **Study DAC** in Tacet and play a track. No Tacet source change is requir
 TACET_RENDERER_URL=http://192.168.1.32:49152/description.xml
 ```
 
-Use the printed address. Tacet's URL validator requires a private LAN IP, **even when both processes run on the same host**. Choose that same LAN IP for `-controller` in that case. The controller address is the source IP as seen by the renderer (watch for NAT/containers). Event callbacks also need to be reachable at that IP. The renderer must be able to fetch the media URL Tacet supplies, including HTTP(S) redirects to a CDN.
+Use the printed address. Tacet's URL validator requires a private LAN IP, **even when both processes run on the same host**. Choose that same LAN IP for `-controller` in that case. The controller address is the source IP as seen by the renderer (watch for NAT/containers). To allow any controller on a trusted subnet, pass its network address instead, e.g. `-controller 192.168.1.0/24`. Every host in that subnet can control playback and volume. Event callbacks must be reachable at the individual subscriber’s source IP. The renderer must be able to fetch the media URL Tacet supplies, including HTTP(S) redirects to a CDN.
 
 ## What works in renderer mode
 
@@ -49,6 +49,6 @@ See the [compatibility suite and hardware reference](testing.md) for the full te
 
 ## Trust boundary and checks
 
-This is a LAN protocol, without TLS or controller authentication. Use a trusted network and firewall; don't port-forward it. SSDP identity is visible to that multicast segment. HTTP requests must come from the configured peer and use the advertised IP:port. A trusted controller can make the renderer fetch remote audio and change the output volume. Only submit trusted audio. Event callbacks must be HTTP URLs with the controller's literal IP; no callback redirects.
+This is a LAN protocol, without TLS or controller authentication. Use a trusted network and firewall; don't port-forward it. SSDP identity is visible to that multicast segment. HTTP requests must come from the configured controller address or subnet and use the advertised IP:port. A trusted controller can make the renderer fetch remote audio and change the output volume. Only submit trusted audio. Event callbacks must be HTTP URLs with the controller's literal IP; no callback redirects.
 
 The automated tests exercise the generated `goupnp/dcps/av1` control point against the HTTP server and a real libmpv null output. For an optional real SSDP search test on a host with multicast-capable loopback, run `TACET_DMR_TEST_SSDP=1 go test ./internal/renderer -run TestLoopbackDiscovery -count=1`. To repeat the native-queue interoperability test on macOS, run `DMR_TEST_IP=<this-host-private-IPv4> DMR_TEST_LIB="$(brew --prefix mpv)/lib" sh scripts/test-tacet.sh`. It uses a Go test overlay against `../tacet` (override with `TACET_SRC`), an ephemeral same-host renderer with SSDP off, and generated WAV audio on null output. It does not edit Tacet. Test audible playback, discovery across your LAN, and DAC exclusivity separately.

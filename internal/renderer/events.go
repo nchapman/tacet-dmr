@@ -49,6 +49,7 @@ func (v eventState) body(s string) string {
 
 type subscription struct {
 	sid, service, callback string
+	peer                   netip.Addr
 	expires                time.Time
 	cancel                 context.CancelFunc
 	updates                chan eventState
@@ -101,12 +102,13 @@ func callbackURL(raw string, peer netip.Addr) (string, bool) {
 func (d *Device) subscription(w http.ResponseWriter, r *http.Request, service string) {
 	sid := r.Header.Get("SID")
 	sub := d.subs[sid]
+	peer := requestPeer(r)
 	cb := r.Header.Get("Callback")
 	nt := r.Header.Get("NT")
 	sec := timeoutSeconds(r.Header.Get("Timeout"))
 	expires := time.Now().Add(time.Duration(sec) * time.Second)
 	if sid != "" {
-		if cb != "" || nt != "" || sub == nil || sub.service != service || time.Now().After(sub.expires) {
+		if cb != "" || nt != "" || sub == nil || sub.peer != peer || sub.service != service || time.Now().After(sub.expires) {
 			w.WriteHeader(412)
 			return
 		}
@@ -121,7 +123,7 @@ func (d *Device) subscription(w http.ResponseWriter, r *http.Request, service st
 			w.WriteHeader(412)
 			return
 		}
-		target, ok := callbackURL(cb, d.peer)
+		target, ok := callbackURL(cb, peer)
 		if !ok {
 			w.WriteHeader(412)
 			return
@@ -132,7 +134,7 @@ func (d *Device) subscription(w http.ResponseWriter, r *http.Request, service st
 		}
 		sid = "uuid:" + uuid.NewString()
 		ctx, cancel := context.WithCancel(context.Background())
-		sub = &subscription{sid, service, target, expires, cancel, make(chan eventState, 1)}
+		sub = &subscription{sid: sid, service: service, callback: target, peer: peer, expires: expires, cancel: cancel, updates: make(chan eventState, 1)}
 		d.subs[sid] = sub
 		w.Header().Set("SID", sid)
 		w.Header().Set("TIMEOUT", fmt.Sprintf("Second-%d", sec))

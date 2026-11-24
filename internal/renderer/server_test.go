@@ -1,12 +1,30 @@
 package renderer
 
 import (
+	"context"
+	"io"
 	"net/netip"
 	"os"
 	"testing"
 
 	ssdp "github.com/koron/go-ssdp"
 )
+
+func TestServeControllerSubnet(t *testing.T) {
+	for _, tc := range []struct {
+		controller string
+		valid      bool
+	}{{"192.168.68.0/22", true}, {"192.168.68.42", true}, {"", false}, {"0.0.0.0/0", false}, {"192.168.0.0/15", false}, {"192.168.68.42/22", false}, {"::1/128", false}} {
+		t.Run(tc.controller, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			err := Serve(ctx, Config{Listen: "127.0.0.1:0", Controller: tc.controller, Name: "test", NoSSDP: true}, nil, io.Discard)
+			if (err == nil) != tc.valid {
+				t.Fatalf("controller %q: %v", tc.controller, err)
+			}
+		})
+	}
+}
 
 // Opt-in real UDP smoke test. Never announce a test renderer on the LAN.
 func TestLoopbackDiscovery(t *testing.T) {
