@@ -24,7 +24,7 @@ func TestTacetDMRQueuePeer(t *testing.T) {
 	defer cancel()
 	ip := os.Getenv("DMR_TEST_IP")
 	cmd := exec.CommandContext(ctx, os.Getenv("DMR_TEST_BIN"), "-serve", ip+":0", "-controller", ip, "-no-ssdp", "-device", "null/")
-	cmd.Env = append(os.Environ(), "DYLD_LIBRARY_PATH="+os.Getenv("DMR_TEST_LIB"))
+	cmd.Env = append(os.Environ(), "DYLD_FALLBACK_LIBRARY_PATH="+os.Getenv("DMR_TEST_LIB"))
 	cmd.Stderr = os.Stderr
 	out, err := cmd.StdoutPipe()
 	if err != nil {

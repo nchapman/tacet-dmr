@@ -9,7 +9,7 @@ if [ "$(uname -s)" = Darwin ]; then
     if [ -z "${DMR_TEST_LIB:-}" ]; then DMR_TEST_LIB="$(brew --prefix mpv)/lib"; fi
     export DMR_TEST_LIB
     # The test executable may not inherit DYLD_* from the go driver.
-    printf '%s\n' '#!/bin/sh' 'export DYLD_LIBRARY_PATH="$DMR_TEST_LIB"' 'exec "$@"' > "$tmp/with-lib"
+    printf '%s\n' '#!/bin/sh' 'export DYLD_FALLBACK_LIBRARY_PATH="$DMR_TEST_LIB"' 'exec "$@"' > "$tmp/with-lib"
     chmod +x "$tmp/with-lib"
     set -- -exec "$tmp/with-lib"
 else

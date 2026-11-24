@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,16 @@ func TestMediaSources(t *testing.T) {
 func TestHelpDoesNotRequireTracks(t *testing.T) {
 	if err := run(context.Background(), []string{"-help"}, nil, io.Discard, io.Discard); !errors.Is(err, flag.ErrHelp) {
 		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"-version"}, nil, &out, io.Discard); err != nil || !strings.HasPrefix(out.String(), "tacet-dmr ") {
+		t.Fatalf("-version: out=%q err=%v", out.String(), err)
+	}
+	if err := run(context.Background(), []string{"-controller", "127.0.0.1"}, nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "-serve") {
+		t.Fatalf("-controller without -serve: got %v", err)
+	}
+	if err := run(context.Background(), []string{"-serve", "127.0.0.1:0", "-controller", "127.0.0.1", "-no-ssdp", "-exclusive"}, nil, io.Discard, io.Discard); err == nil {
+		t.Fatal("-serve -exclusive without valid named device should fail at startup")
 	}
 }
 
@@ -167,6 +178,14 @@ func TestServeVolumeWiring(t *testing.T) {
 		t.Fatalf("software exclusive should default to 30, got %+v", softExcl)
 	}
 
+	validExclDevice := "alsa/hw:99,0"
+	switch runtime.GOOS {
+	case "darwin":
+		validExclDevice = "coreaudio/tacet-test-nonexistent"
+	case "windows":
+		validExclDevice = "wasapi/tacet-test-nonexistent"
+	}
+
 	// Exercise the full run(-serve) path with an injected hardware override.
 	prevOpen := openVolumeControl
 	prevProbe := volumeProber
@@ -179,7 +198,7 @@ func TestServeVolumeWiring(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	var out bytes.Buffer
-	if err := run(ctx, []string{"-serve", "127.0.0.1:0", "-controller", "127.0.0.1", "-no-ssdp", "-exclusive"}, nil, &out, io.Discard); err != nil {
+	if err := run(ctx, []string{"-serve", "127.0.0.1:0", "-controller", "127.0.0.1", "-no-ssdp", "-device", validExclDevice, "-exclusive"}, nil, &out, io.Discard); err != nil {
 		t.Fatalf("run(-serve): %v", err)
 	}
 	if len(hw.writes) != 0 || !strings.Contains(out.String(), "Volume: stub hardware") {
@@ -193,7 +212,7 @@ func TestServeVolumeWiring(t *testing.T) {
 	out.Reset()
 	ctx2, cancel2 := context.WithCancel(t.Context())
 	cancel2()
-	if err := run(ctx2, []string{"-serve", "127.0.0.1:0", "-controller", "127.0.0.1", "-no-ssdp", "-exclusive"}, nil, &out, io.Discard); err != nil {
+	if err := run(ctx2, []string{"-serve", "127.0.0.1:0", "-controller", "127.0.0.1", "-no-ssdp", "-device", validExclDevice, "-exclusive"}, nil, &out, io.Discard); err != nil {
 		t.Fatalf("run(-serve watching): %v", err)
 	}
 	if !strings.Contains(out.String(), "Volume: mpv software (watching for hardware device)") {

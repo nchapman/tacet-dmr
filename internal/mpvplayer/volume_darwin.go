@@ -50,8 +50,8 @@ type darwinCoreAudio struct {
 	getSize   func(uint32, *caPropAddr, uint32, unsafe.Pointer, *uint32) int32
 	getData   func(uint32, *caPropAddr, uint32, unsafe.Pointer, *uint32, unsafe.Pointer) int32
 	setData   func(uint32, *caPropAddr, uint32, unsafe.Pointer, uint32, unsafe.Pointer) int32
-	cfGetCStr func(unsafe.Pointer, *byte, int, uint32) uint8
-	cfRelease func(unsafe.Pointer)
+	cfGetCStr func(uintptr, *byte, int64, uint32) uint8
+	cfRelease func(uintptr)
 }
 
 var systemCoreAudio darwinCoreAudio
@@ -92,10 +92,12 @@ func (a *darwinCoreAudio) deviceIDs() ([]uint32, error) {
 		return nil, nil
 	}
 	ids := make([]uint32, sz/4)
+	sz = uint32(len(ids) * 4)
 	if rc := a.getData(caSystemObject, &addr, 0, nil, &sz, unsafe.Pointer(&ids[0])); rc != 0 {
 		return nil, fmt.Errorf("CoreAudio device list: %d", rc)
 	}
-	return ids[:sz/4], nil
+	n := min(int(sz/4), len(ids))
+	return ids[:n], nil
 }
 
 func (a *darwinCoreAudio) deviceUID(id uint32) (string, bool) {
@@ -103,14 +105,16 @@ func (a *darwinCoreAudio) deviceUID(id uint32) (string, bool) {
 		return "", false
 	}
 	addr := caPropAddr{caDeviceUID, caScopeGlobal, caElementMain}
-	var ref unsafe.Pointer
+	// CoreFoundation handles can be tagged pointers (NSTaggedPointerString),
+	// so keep CFStringRef as uintptr rather than unsafe.Pointer.
+	var ref uintptr
 	sz := uint32(unsafe.Sizeof(ref))
-	if rc := a.getData(id, &addr, 0, nil, &sz, unsafe.Pointer(&ref)); rc != 0 || ref == nil {
+	if rc := a.getData(id, &addr, 0, nil, &sz, unsafe.Pointer(&ref)); rc != 0 || ref == 0 {
 		return "", false
 	}
 	defer a.cfRelease(ref)
 	buf := make([]byte, 1024)
-	if a.cfGetCStr(ref, &buf[0], len(buf), cfStringUTF8) == 0 {
+	if a.cfGetCStr(ref, &buf[0], int64(len(buf)), cfStringUTF8) == 0 {
 		return "", false
 	}
 	if idx := bytes.IndexByte(buf, 0); idx >= 0 {

@@ -6,11 +6,11 @@ Play music from [Tacet](https://github.com/nchapman/tacet) on a DAC attached to 
 
 Download the archive for your OS and CPU from [Releases](https://github.com/nchapman/tacet-dmr/releases). CI also attaches `tacet-dmr-binaries` to successful [workflow runs](https://github.com/nchapman/tacet-dmr/actions). Archives include the executable and documentation, **not libmpv**. Install a matching-architecture libmpv 2 runtime (mpv 0.41 or 0.42); see [platform setup](docs/playback.md). Verify the download using the accompanying `SHA256SUMS`.
 
-- **macOS:** `darwin-arm64` for Apple Silicon, `darwin-amd64` for Intel. With Homebrew mpv, use `export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix mpv)/lib"` if needed.
+- **macOS:** `darwin-arm64` for Apple Silicon, `darwin-amd64` for Intel. On Apple Silicon with Homebrew mpv, `export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix mpv)/lib"` is required so `libmpv.2.dylib` is found.
 - **Linux:** `linux-amd64` or `linux-arm64` for glibc-based systems. Ubuntu 26.04 provides `libmpv2`.
 - **Windows:** `windows-amd64` or `windows-arm64`. Put the matching libmpv DLL and its dependencies next to `tacet-dmr.exe`.
 
-On the renderer machine, replace **both example addresses** with your own: `-serve` binds to the renderer’s LAN IPv4 address, and `-controller` allows the Tacet server’s IPv4 address. On `main` you can instead pass a trusted LAN subnet, e.g. `-controller 192.168.1.0/24`, to let any host on that subnet control playback.
+On the renderer machine, replace **both example addresses** with your own: `-serve` binds to the renderer’s LAN IPv4 address or interface name (e.g. `en0:49152`), and `-controller` allows the Tacet server’s IPv4 address or a trusted LAN subnet (e.g. `192.168.1.0/24`).
 
 ```sh
 ./tacet-dmr -list-devices

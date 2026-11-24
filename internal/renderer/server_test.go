@@ -115,7 +115,7 @@ func TestLoopbackDiscovery(t *testing.T) {
 	const location = "http://127.0.0.1:12345/description.xml"
 	prior := ssdp.Interfaces
 	t.Cleanup(func() { ssdp.Interfaces = prior })
-	ads, err := startSSDP(netip.MustParseAddr("127.0.0.1"), udn, location)
+	ads, err := startSSDP(netip.MustParseAddr("127.0.0.1"), udn, location, "test")
 	if err != nil {
 		t.Fatal(err)
 	}

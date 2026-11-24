@@ -42,6 +42,9 @@ func (p *Player) startNetworkEvents() error {
 			case <-q.stop:
 				return
 			}
+			if p.shutdown {
+				return
+			}
 		}
 	}()
 	return nil

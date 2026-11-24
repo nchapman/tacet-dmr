@@ -20,6 +20,7 @@ import (
 
 type Config struct {
 	Listen, Controller, Name, UUID string
+	Version                        string
 	NoSSDP                         bool
 	Exclusive                      bool                          // defaults software volume to 30 when InitialVolume is nil
 	InitialVolume                  *int                          // nil: 100 shared, 30 exclusive software, or current device level for hardware
@@ -177,13 +178,16 @@ func (ads advertisements) alive() error {
 	}
 	return nil
 }
-func startSSDP(ip netip.Addr, udn, location string) (advertisements, error) {
+func startSSDP(ip netip.Addr, udn, location, version string) (advertisements, error) {
 	iface, err := interfaceFor(ip)
 	if err != nil {
 		return nil, err
 	}
 	if iface.Flags&net.FlagMulticast == 0 {
 		return nil, fmt.Errorf("interface %s does not support multicast; use -no-ssdp for direct URL", iface.Name)
+	}
+	if version == "" {
+		version = "0.1"
 	}
 	// go-ssdp has process-wide interface selection. The CLI runs one renderer.
 	ssdp.Interfaces = []net.Interface{*iface}
@@ -197,7 +201,7 @@ func startSSDP(ip netip.Addr, udn, location string) (advertisements, error) {
 		if st != udn {
 			usn += "::" + st
 		}
-		ad, err := ssdp.Advertise(st, usn, location, runtime.GOOS+"/1 UPnP/1.0 tacet-dmr/0.1", 1800, ssdp.TTL(1))
+		ad, err := ssdp.Advertise(st, usn, location, runtime.GOOS+"/1 UPnP/1.0 tacet-dmr/"+version, 1800, ssdp.TTL(1))
 		if err != nil {
 			ads.close()
 			return nil, err
@@ -260,7 +264,7 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	go func() { ended <- srv.Serve(ln) }()
 	var ads advertisements
 	if !c.NoSSDP {
-		ads, err = startSSDP(ap.Addr(), udn, location)
+		ads, err = startSSDP(ap.Addr(), udn, location, c.Version)
 		if err != nil {
 			return fmt.Errorf("start SSDP: %w", err)
 		}

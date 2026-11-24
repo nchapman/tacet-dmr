@@ -4,6 +4,7 @@ package mpvplayer
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ type Player struct {
 	m             *mpv.Mpv
 	reading       int64
 	finalDuration time.Duration
+	shutdown      bool
 	events        *networkEvents
 }
 
@@ -34,9 +36,22 @@ func OpenNetwork(device string, exclusive bool) (*Player, error) {
 	return open(device, exclusive, true)
 }
 
+// IsExclusiveTarget reports whether the requested device/flag uses exclusive output.
+func IsExclusiveTarget(device string, exclusive bool) bool {
+	return exclusive || strings.HasPrefix(device, "coreaudio_exclusive/")
+}
+
+// ValidateTarget validates device/exclusive compatibility without opening hardware.
+func ValidateTarget(device string, exclusive bool) error {
+	if IsExclusiveTarget(device, exclusive) && !exclusiveDevice(runtime.GOOS, device) {
+		return errors.New("exclusive output requires a named coreaudio, wasapi, or direct alsa/hw: device for this OS")
+	}
+	return nil
+}
+
 func open(device string, exclusive, network bool) (*Player, error) {
-	if exclusive && !exclusiveDevice(runtime.GOOS, device) {
-		return nil, errors.New("exclusive output requires a named coreaudio, wasapi, or direct alsa/hw: device for this OS")
+	if err := ValidateTarget(device, exclusive); err != nil {
+		return nil, err
 	}
 	m := mpv.New()
 	options := [][2]string{
@@ -93,12 +108,17 @@ func exclusiveDevice(os, device string) bool {
 }
 
 func (p *Player) Close() {
+	if p.m == nil {
+		return
+	}
 	if p.events != nil {
 		close(p.events.stop)
 		p.m.Wakeup()
 		<-p.events.done
+		p.events = nil
 	}
 	p.m.TerminateDestroy()
+	p.m = nil
 }
 
 func (p *Player) Devices() ([]playback.Device, error) {
@@ -159,12 +179,19 @@ func (p *Player) Seek(pos time.Duration) error {
 	return p.m.Command([]string{"seek", strconv.FormatFloat(pos.Seconds(), 'f', 6, 64), "absolute+exact"})
 }
 
+func safeDuration(sec float64) time.Duration {
+	if math.IsNaN(sec) || math.IsInf(sec, 0) || sec <= 0 {
+		return 0
+	}
+	return time.Duration(sec * float64(time.Second))
+}
+
 func (p *Player) Status() playback.Status {
 	// Media properties are legitimately unavailable before loading and at EOF.
 	seconds := func(key string) time.Duration {
 		v, _ := p.m.GetProperty(key, mpv.FormatDouble)
 		f, _ := v.(float64)
-		return time.Duration(f * float64(time.Second))
+		return safeDuration(f)
 	}
 	number := func(key string) int {
 		v, _ := p.m.GetProperty(key, mpv.FormatInt64)
@@ -212,11 +239,14 @@ func (p *Player) readNotice(timeout time.Duration) (playback.Notice, error) {
 		// until HookContinue, so this sample cannot belong to the successor.
 		v, _ := p.m.GetProperty("duration", mpv.FormatDouble)
 		sec, _ := v.(float64)
-		p.finalDuration = time.Duration(sec * float64(time.Second))
+		p.finalDuration = safeDuration(sec)
 		err = p.m.HookContinue(e.Hook().ID)
 	case mpv.EventEnd:
 		end := e.EndFile()
 		id = end.EntryID
+		if p.reading == id {
+			p.reading = 0
+		}
 		switch end.Reason {
 		case mpv.EndFileEOF:
 			kind = playback.TrackFinished
@@ -230,6 +260,8 @@ func (p *Player) readNotice(timeout time.Duration) (playback.Notice, error) {
 		}
 	case mpv.EventShutdown:
 		id = 0
+		p.reading = 0
+		p.shutdown = true
 		kind = playback.Stopped
 	case mpv.EventQueueOverflow:
 		id = 0

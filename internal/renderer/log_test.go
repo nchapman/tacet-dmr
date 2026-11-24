@@ -140,12 +140,83 @@ func TestHotplugAppliesExplicitInitialVolumeOnAttach(t *testing.T) {
 			return hw
 		},
 	})
-	hw = &fakeVolumeControl{vol: 100, mute: false}
+	// Transient write error during initial USB enumeration must not drop the
+	// explicit -volume cap; the next probe retries and applies it cleanly.
+	hw = &fakeVolumeControl{vol: 100, mute: false, volErr: errors.New("enumerating")}
 	tpt.nextProbe = time.Time{}
 	tpt.refresh()
+	if tpt.vol != nil || !tpt.applyInitialToHW {
+		t.Fatalf("failed initial attach should keep retrying: vol=%v pending=%t", tpt.vol, tpt.applyInitialToHW)
+	}
 
+	hw.volErr = nil
+	tpt.nextProbe = time.Time{}
+	tpt.refresh()
 	if len(hw.setCalls) != 1 || hw.setCalls[0] != 25 || tpt.volume != 25 {
 		t.Fatalf("explicit -volume 25 should apply on first DAC attach: calls=%v vol=%d", hw.setCalls, tpt.volume)
+	}
+}
+
+func TestSetVolumeProbesNewlyConnectedDACAndSupportsUPnPYesNoMute(t *testing.T) {
+	var hw *fakeVolumeControl
+	tpt := newTransport(nil, deviceOptions{
+		exclusive: true,
+		probeVolume: func() playback.VolumeControl {
+			if hw == nil {
+				return nil
+			}
+			return hw
+		},
+	})
+	// DAC plugs in during the 1s probe backoff window; SetVolume must probe
+	// immediately and write to hardware instead of letting the next tick overwrite it.
+	tpt.nextProbe = time.Now().Add(time.Minute)
+	hw = &fakeVolumeControl{vol: 100, mute: false}
+	if _, f := tpt.call(rc, "SetVolume", fields{"InstanceID": "0", "Channel": "Master", "DesiredVolume": "22"}); f != nil {
+		t.Fatalf("SetVolume: %v", f)
+	}
+	if hw.vol != 22 || tpt.volume != 22 {
+		t.Fatalf("SetVolume missed newly connected DAC: hw=%d tpt=%d", hw.vol, tpt.volume)
+	}
+	if _, f := tpt.call(rc, "SetMute", fields{"InstanceID": "0", "Channel": "Master", "DesiredMute": "yes"}); f != nil {
+		t.Fatalf("SetMute(yes): %v", f)
+	}
+	if !hw.mute {
+		t.Fatal("SetMute(yes) did not mute hardware")
+	}
+	if _, f := tpt.call(rc, "SetMute", fields{"InstanceID": "0", "Channel": "Master", "DesiredMute": "no"}); f != nil {
+		t.Fatalf("SetMute(no): %v", f)
+	}
+	if hw.mute {
+		t.Fatal("SetMute(no) did not unmute hardware")
+	}
+}
+
+func TestAVTransportNaturalAdvanceClearsCompletedTrack(t *testing.T) {
+	var eng *queueEngine
+	tpt := newTransport(func() (Engine, error) {
+		eng = &queueEngine{entries: make(map[int64]string)}
+		return eng, nil
+	}, deviceOptions{})
+	tpt.call(av, "SetAVTransportURI", fields{"InstanceID": "0", "CurrentURI": "http://127.0.0.1/a.wav", "CurrentURIMetaData": ""})
+	tpt.call(av, "SetNextAVTransportURI", fields{"InstanceID": "0", "NextURI": "http://127.0.0.1/b.wav", "NextURIMetaData": ""})
+	tpt.call(av, "Play", fields{"InstanceID": "0", "Speed": "1"})
+	tpt.refresh()
+	eng.eof()
+	tpt.refresh()
+
+	actions, _ := tpt.call(av, "GetCurrentTransportActions", fields{"InstanceID": "0"})
+	if strings.Contains(actions["Actions"], "Previous") {
+		t.Fatalf("Previous should not be available after AVTransport NextURI advance: %q", actions["Actions"])
+	}
+	media, _ := tpt.call(av, "GetMediaInfo", fields{"InstanceID": "0"})
+	if media["CurrentURI"] != "http://127.0.0.1/b.wav" || media["NextURI"] != "" {
+		t.Fatalf("AVTransport state after advance = %+v", media)
+	}
+	tpt.call(av, "SetPlayMode", fields{"InstanceID": "0", "NewPlayMode": "REPEAT_ALL"})
+	media, _ = tpt.call(av, "GetMediaInfo", fields{"InstanceID": "0"})
+	if media["NextURI"] == "http://127.0.0.1/a.wav" {
+		t.Fatalf("completed track leaked back into REPEAT_ALL NextURI: %+v", media)
 	}
 }
 

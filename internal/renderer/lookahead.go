@@ -97,7 +97,14 @@ func (t *transport) refresh() {
 				}
 				t.active = ev.Entry
 				t.next = stagedEntry{}
-				t.q.index = i
+				if t.q.name == "" {
+					// In standard AVTransport mode, advancing promotes NextURI
+					// to the sole current track and clears Previous/NextURI.
+					t.q.items = []track{t.q.items[i]}
+					t.q.index = 0
+				} else {
+					t.q.index = i
+				}
 				t.pos = 0
 				t.duration = 0
 				t.ended = false

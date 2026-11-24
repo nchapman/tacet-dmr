@@ -243,3 +243,16 @@ func TestOpenVolumeControlReturnsNilForNonExclusiveOrNull(t *testing.T) {
 		t.Fatal("exclusive coreaudio should return a hotplug volume prober")
 	}
 }
+
+func TestSystemCoreAudioReadOnlySmoke(t *testing.T) {
+	ids, err := systemCoreAudio.deviceIDs()
+	if err != nil {
+		t.Fatalf("deviceIDs: %v", err)
+	}
+	for _, id := range ids {
+		uid, ok := systemCoreAudio.deviceUID(id)
+		if !ok || uid == "" {
+			t.Errorf("device %d returned empty UID", id)
+		}
+	}
+}

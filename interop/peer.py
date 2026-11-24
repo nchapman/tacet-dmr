@@ -14,6 +14,7 @@ from controlpoint import AV, ControlPoint, OriginRequester
 
 class PeerTest(unittest.IsolatedAsyncioTestCase):
     multicast = False
+    device = 'null/'
     extra_args = ()
 
     async def asyncSetUp(self):
@@ -22,11 +23,11 @@ class PeerTest(unittest.IsolatedAsyncioTestCase):
             self.fail('use scripts/check.sh or set DMR_TEST_BIN to a built renderer')
         env = os.environ.copy()
         if lib := env.get('DMR_TEST_LIB'):
-            env['DYLD_LIBRARY_PATH'] = lib
+            env['DYLD_FALLBACK_LIBRARY_PATH'] = lib
         # No option to target another renderer. Even accidental CI environment
         # overrides must never aim the mutation suite at someone's speakers.
         proc = await asyncio.create_subprocess_exec(
-            binary, '-serve', '127.0.0.1:0', '-controller', '127.0.0.1', '-device', 'null/',
+            binary, '-serve', '127.0.0.1:0', '-controller', '127.0.0.1', '-device', self.device,
             *([] if self.multicast else ['-no-ssdp']), *self.extra_args,
             stdout=asyncio.subprocess.PIPE, env=env)
         self.addAsyncCleanup(self.stop_process, proc)

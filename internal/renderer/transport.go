@@ -54,9 +54,10 @@ type transport struct {
 	p                     Engine
 	vol                   playback.VolumeControl // nil: mpv handles volume and mute (default)
 	probeVol              func() playback.VolumeControl
-	nextProbe             time.Time
+	nextProbe, nextSync   time.Time
 	volOffline            bool
 	applyInitialToHW      bool // explicit -volume pending until hotplugged hardware appears
+	explicitInitialVolume bool
 	active, loggedEntry   int64
 	next                  stagedEntry
 	ended                 bool // natural EOF received, waiting for successor to become playable
@@ -82,13 +83,24 @@ func clampVolume(v int) int {
 func sanitizeURI(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return raw
+		return "<invalid-uri>"
 	}
 	u.User = nil
 	u.RawQuery = ""
 	u.ForceQuery = false
 	u.Fragment = ""
 	return u.String()
+}
+
+func parseUPnPBool(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes":
+		return true, nil
+	case "0", "false", "no":
+		return false, nil
+	default:
+		return false, errors.New("invalid boolean")
+	}
 }
 
 func newTransport(open Factory, opts deviceOptions) *transport {
@@ -100,15 +112,16 @@ func newTransport(open Factory, opts deviceOptions) *transport {
 		v = clampVolume(*opts.initialVolume)
 	}
 	t := &transport{
-		open:             open,
-		vol:              opts.volume,
-		probeVol:         opts.probeVolume,
-		applyInitialToHW: opts.initialVolume != nil && opts.volume == nil && opts.probeVolume != nil,
-		q:                playlist{mode: normal},
-		state:            "NO_MEDIA_PRESENT",
-		status:           "OK",
-		volume:           v,
-		initialVolume:    v,
+		open:                  open,
+		vol:                   opts.volume,
+		probeVol:              opts.probeVolume,
+		applyInitialToHW:      opts.initialVolume != nil && opts.volume == nil && opts.probeVolume != nil,
+		explicitInitialVolume: opts.initialVolume != nil,
+		q:                     playlist{mode: normal},
+		state:                 "NO_MEDIA_PRESENT",
+		status:                "OK",
+		volume:                v,
+		initialVolume:         v,
 	}
 	if opts.log != nil {
 		t.logger = log.New(opts.log, "", log.LstdFlags)
@@ -151,24 +164,31 @@ func (t *transport) logOutput() {
 }
 
 func (t *transport) attachVolume(vol playback.VolumeControl) {
+	if t.applyInitialToHW {
+		if err := vol.SetVolume(t.volume); err != nil {
+			t.logf("error: apply initial volume to %v: %v", vol, err)
+			return
+		}
+		t.applyInitialToHW = false
+	}
 	t.vol = vol
 	t.volOffline = false
+	t.nextSync = time.Now().Add(500 * time.Millisecond)
 	if m, err := vol.Mute(); err == nil {
 		t.hwMute = true
 		t.mute = m
 	} else {
 		t.hwMute = false
 	}
-	if t.applyInitialToHW {
-		t.applyInitialToHW = false
-		if err := vol.SetVolume(t.volume); err != nil {
-			t.logf("error: apply initial volume to %v: %v", vol, err)
-		} else if actual, err := vol.Volume(); err == nil {
-			t.volume = clampVolume(actual)
-		}
-	} else if hwVol, err := vol.Volume(); err == nil {
+	if hwVol, err := vol.Volume(); err == nil {
 		t.volume = clampVolume(hwVol)
-		t.initialVolume = t.volume
+		if !t.explicitInitialVolume {
+			t.initialVolume = t.volume
+		}
+	}
+	if t.p != nil {
+		_ = t.p.SetVolume(100)
+		_ = t.p.SetMute(t.mute && !t.hwMute)
 	}
 	muteMode := "software"
 	if t.hwMute {
@@ -191,7 +211,11 @@ func (t *transport) syncVolume(force bool) {
 		}
 		return
 	}
-	if t.volOffline && !force && time.Now().Before(t.nextProbe) {
+	if t.volOffline {
+		if !force && time.Now().Before(t.nextProbe) {
+			return
+		}
+	} else if !force && time.Now().Before(t.nextSync) {
 		return
 	}
 	v, err := t.vol.Volume()
@@ -203,6 +227,7 @@ func (t *transport) syncVolume(force bool) {
 		t.nextProbe = time.Now().Add(time.Second)
 		return
 	}
+	t.nextSync = time.Now().Add(500 * time.Millisecond)
 	t.volume = clampVolume(v)
 	if t.volOffline {
 		t.volOffline = false
@@ -212,12 +237,20 @@ func (t *transport) syncVolume(force bool) {
 		} else if errors.Is(err, playback.ErrUnsupported) {
 			t.hwMute = false
 		}
+		if t.p != nil {
+			_ = t.p.SetMute(t.mute && !t.hwMute)
+		}
 		t.logf("volume: %v reconnected (level=%d)", t.vol, t.volume)
 		return
 	}
 	if t.hwMute {
 		if m, err := t.vol.Mute(); err == nil {
 			t.mute = m
+		} else if errors.Is(err, playback.ErrUnsupported) {
+			t.hwMute = false
+			if t.p != nil {
+				_ = t.p.SetMute(t.mute)
+			}
 		}
 	}
 }
@@ -504,6 +537,9 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 		if err != nil || v < 0 || v > 100 {
 			return nil, invalid
 		}
+		if t.vol == nil || t.volOffline {
+			t.syncVolume(true)
+		}
 		t.applyInitialToHW = false
 		if t.vol != nil {
 			if err := t.vol.SetVolume(v); err != nil {
@@ -528,9 +564,12 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 		t.syncVolume(true)
 		return fields{"CurrentMute": onOff(t.mute)}, nil
 	case "SetMute":
-		v, err := strconv.ParseBool(a["DesiredMute"])
+		v, err := parseUPnPBool(a["DesiredMute"])
 		if err != nil {
 			return nil, invalid
+		}
+		if t.vol == nil || t.volOffline {
+			t.syncVolume(true)
 		}
 		if t.vol != nil && t.hwMute {
 			if err := t.vol.SetMute(v); err != nil {
@@ -557,10 +596,10 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 		if a["PresetName"] != "FactoryDefaults" {
 			return nil, invalid
 		}
-		if _, f := t.call(rc, "SetVolume", fields{"InstanceID": "0", "DesiredVolume": strconv.Itoa(t.initialVolume)}); f != nil {
+		if _, f := t.dispatch(rc, "SetVolume", fields{"InstanceID": "0", "Channel": "Master", "DesiredVolume": strconv.Itoa(t.initialVolume)}); f != nil {
 			return nil, f
 		}
-		return t.call(rc, "SetMute", fields{"InstanceID": "0", "DesiredMute": "0"})
+		return t.dispatch(rc, "SetMute", fields{"InstanceID": "0", "Channel": "Master", "DesiredMute": "0"})
 	case "GetProtocolInfo":
 		return fields{"Sink": protocols}, nil
 	case "GetCurrentConnectionIDs":

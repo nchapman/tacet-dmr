@@ -5,8 +5,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
-ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags nocgo -trimpath -ldflags='-s -w' -o /out/tacet-dmr ./cmd/tacet-dmr
+ARG TARGETOS TARGETARCH VERSION=dev
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags nocgo -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/tacet-dmr ./cmd/tacet-dmr
 
 # The runtime library and its transitive codec/output dependencies are needed
 # even for -help. Keep the distro copyright notices in the final image.

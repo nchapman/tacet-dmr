@@ -84,18 +84,37 @@ func timeoutSeconds(s string) int {
 	return 300
 }
 func callbackURL(raw string, peer netip.Addr) (string, bool) {
-	if len(raw) < 3 || raw[0] != '<' || raw[len(raw)-1] != '>' {
+	s := strings.TrimSpace(raw)
+	if !strings.HasPrefix(s, "<") || !strings.HasSuffix(s, ">") {
 		return "", false
 	}
-	u, err := url.Parse(raw[1 : len(raw)-1])
-	if err != nil || u.Scheme != "http" || u.User != nil || u.Fragment != "" {
-		return "", false
+	// UPnP UDA 1.0 permits multiple <url> entries; parse each cleanly without
+	// letting an inner '>' bleed into the path of the first URL.
+	for len(s) > 0 {
+		s = strings.TrimSpace(s)
+		if !strings.HasPrefix(s, "<") {
+			return "", false
+		}
+		end := strings.IndexByte(s, '>')
+		if end <= 1 {
+			return "", false
+		}
+		token := s[1:end]
+		if strings.ContainsRune(token, '<') {
+			return "", false
+		}
+		s = strings.TrimSpace(s[end+1:])
+		u, err := url.Parse(token)
+		if err != nil || u.Scheme != "http" || u.User != nil || u.Fragment != "" {
+			continue
+		}
+		ip, err := netip.ParseAddr(u.Hostname())
+		if err != nil || ip.Unmap() != peer.Unmap() {
+			continue
+		}
+		return u.String(), true
 	}
-	ip, err := netip.ParseAddr(u.Hostname())
-	if err != nil || ip.Unmap() != peer.Unmap() {
-		return "", false
-	}
-	return u.String(), true
+	return "", false
 }
 
 // Called under d.mu. All lifecycle changes serialize with state snapshots.
@@ -132,6 +151,10 @@ func (d *Device) subscription(w http.ResponseWriter, r *http.Request, service st
 			w.WriteHeader(503)
 			return
 		}
+		if service == rc {
+			d.t.syncVolume(true)
+			d.publish()
+		}
 		sid = "uuid:" + uuid.NewString()
 		ctx, cancel := context.WithCancel(context.Background())
 		sub = &subscription{sid: sid, service: service, callback: target, peer: peer, expires: expires, cancel: cancel, updates: make(chan eventState, 1)}
@@ -140,7 +163,6 @@ func (d *Device) subscription(w http.ResponseWriter, r *http.Request, service st
 		w.Header().Set("TIMEOUT", fmt.Sprintf("Second-%d", sec))
 		w.WriteHeader(200)
 		_ = http.NewResponseController(w).Flush()
-		d.t.syncVolume(true)
 		d.wg.Add(1)
 		go d.notify(ctx, sub, d.t.eventState())
 		return
@@ -154,20 +176,36 @@ func (d *Device) notify(ctx context.Context, s *subscription, v eventState) {
 	defer d.wg.Done()
 	var seq uint32
 	for {
-		req, err := http.NewRequestWithContext(ctx, "NOTIFY", s.callback, strings.NewReader(v.body(s.service)))
-		if err == nil {
-			req.Header.Set("Content-Type", `text/xml; charset="utf-8"`)
-			req.Header.Set("NT", "upnp:event")
-			req.Header.Set("NTS", "upnp:propchange")
-			req.Header.Set("SID", s.sid)
-			req.Header.Set("SEQ", strconv.FormatUint(uint64(seq), 10))
-			var resp *http.Response
-			resp, err = d.client.Do(req)
-			if resp != nil {
-				resp.Body.Close()
-				if resp.StatusCode/100 != 2 {
-					err = fmt.Errorf("callback returned %d", resp.StatusCode)
+		var err error
+		for attempt := 0; attempt < 2; attempt++ {
+			if attempt > 0 {
+				timer := time.NewTimer(150 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
 				}
+			}
+			var req *http.Request
+			req, err = http.NewRequestWithContext(ctx, "NOTIFY", s.callback, strings.NewReader(v.body(s.service)))
+			if err == nil {
+				req.Header.Set("Content-Type", `text/xml; charset="utf-8"`)
+				req.Header.Set("NT", "upnp:event")
+				req.Header.Set("NTS", "upnp:propchange")
+				req.Header.Set("SID", s.sid)
+				req.Header.Set("SEQ", strconv.FormatUint(uint64(seq), 10))
+				var resp *http.Response
+				resp, err = d.client.Do(req)
+				if resp != nil {
+					resp.Body.Close()
+					if resp.StatusCode/100 != 2 {
+						err = fmt.Errorf("callback returned %d", resp.StatusCode)
+					}
+				}
+			}
+			if err == nil {
+				break
 			}
 		}
 		if err != nil {

@@ -101,8 +101,18 @@ func requestPeer(r *http.Request) netip.Addr {
 	ap, _ := netip.ParseAddrPort(r.RemoteAddr)
 	return ap.Addr().Unmap() // invalid on parse error; never matches a prefix
 }
+func validHost(got, want string) bool {
+	if got == want {
+		return true
+	}
+	if bare, ok := strings.CutSuffix(want, ":80"); ok && got == bare {
+		return true
+	}
+	return false
+}
+
 func (d *Device) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !d.peers.Contains(requestPeer(r)) || r.Host != d.host || r.Header.Get("Origin") != "" {
+	if !d.peers.Contains(requestPeer(r)) || !validHost(r.Host, d.host) || r.Header.Get("Origin") != "" {
 		http.Error(w, "not an allowed controller", http.StatusForbidden)
 		return
 	}

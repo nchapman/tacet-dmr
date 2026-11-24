@@ -31,6 +31,7 @@ func main() {
 }
 
 var (
+	version           = "dev"
 	openVolumeControl = mpvplayer.OpenVolumeControl
 	volumeProber      = mpvplayer.VolumeProber
 )
@@ -67,6 +68,8 @@ func configureServerVolume(c *renderer.Config, vol playback.VolumeControl, probe
 
 func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) error {
 	fs := flag.NewFlagSet("tacet-dmr", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	showVersion := fs.Bool("version", false, "print version and exit")
 	list := fs.Bool("list-devices", false, "list audio output device IDs and exit")
 	device := fs.String("device", "", "mpv output device ID (default: automatic)")
 	excl := fs.Bool("exclusive", false, "request exclusive audio on a named native device")
@@ -86,24 +89,51 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	fs.StringVar(&server.UUID, "uuid", "", "override stable renderer UUID (default: derived from hostname)")
 	fs.BoolVar(&server.NoSSDP, "no-ssdp", false, "disable multicast discovery; use the printed description URL")
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: tacet-dmr [flags] FILE-OR-HTTP-URL ...\n       tacet-dmr -serve LAN-IP-OR-IFACE:PORT -controller TACET-IP [flags]")
+		fmt.Fprintln(fs.Output(), "Usage: tacet-dmr [flags] FILE-OR-HTTP-URL ...\n       tacet-dmr -serve LAN-IP-OR-IFACE:PORT -controller TACET-IP-OR-CIDR [flags]\n       tacet-dmr -list-devices | -version")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *showVersion {
+		fmt.Fprintf(out, "tacet-dmr %s\n", version)
+		return nil
+	}
+	exclusive := mpvplayer.IsExclusiveTarget(*device, *excl)
 	if server.Listen != "" {
 		if *list || *interactive || fs.NArg() != 0 {
 			return errors.New("-serve cannot be combined with local tracks, -interactive or -list-devices")
 		}
+		if err := mpvplayer.ValidateTarget(*device, exclusive); err != nil {
+			return err
+		}
+		server.Version = version
 		server.Log = errOut
-		configureServerVolume(&server, openVolumeControl(*device, *excl), volumeProber(*device, *excl), *excl)
-		return renderer.Serve(ctx, server, func() (renderer.Engine, error) { return mpvplayer.OpenNetwork(*device, *excl) }, out)
+		configureServerVolume(&server, openVolumeControl(*device, exclusive), volumeProber(*device, exclusive), exclusive)
+		return renderer.Serve(ctx, server, func() (renderer.Engine, error) { return mpvplayer.OpenNetwork(*device, exclusive) }, out)
 	}
-	if *list && fs.NArg() != 0 {
-		return errors.New("-list-devices takes no tracks")
+	if server.Controller != "" || server.UUID != "" || server.NoSSDP {
+		return errors.New("-controller, -uuid, and -no-ssdp require -serve")
 	}
-	if !*list && fs.NArg() == 0 {
+	if *list {
+		if fs.NArg() != 0 {
+			return errors.New("-list-devices takes no tracks")
+		}
+		p, err := mpvplayer.Open("", false)
+		if err != nil {
+			return err
+		}
+		defer p.Close()
+		devices, err := p.Devices()
+		if err != nil {
+			return err
+		}
+		for _, d := range devices {
+			fmt.Fprintf(out, "%s\t%s\n", d.ID, d.Description)
+		}
+		return nil
+	}
+	if fs.NArg() == 0 {
 		fs.Usage()
 		return errors.New("no tracks supplied")
 	}
@@ -115,26 +145,18 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		}
 		tracks = append(tracks, track)
 	}
-	p, err := mpvplayer.Open(*device, *excl)
+	p, err := mpvplayer.Open(*device, exclusive)
 	if err != nil {
 		return err
 	}
 	defer p.Close()
-	if *list {
-		devices, err := p.Devices()
-		if err != nil {
-			return err
-		}
-		for _, d := range devices {
-			fmt.Fprintf(out, "%s\t%s\n", d.ID, d.Description)
-		}
-		return nil
-	}
-	if err := configureLocalVolume(p.SetVolume, openVolumeControl(*device, *excl), server.InitialVolume, *excl); err != nil {
+	if err := configureLocalVolume(p.SetVolume, openVolumeControl(*device, exclusive), server.InitialVolume, exclusive); err != nil {
 		return err
 	}
+	playCtx, cancelPlay := context.WithCancel(ctx)
+	defer cancelPlay()
 	var commands <-chan string
-	if *interactive {
+	if *interactive && in != nil {
 		fmt.Fprintln(out, "Commands: pause, play, seek <duration> (e.g. 1m20s), status, stop")
 		lines := make(chan string)
 		commands = lines
@@ -144,16 +166,16 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 			for scanner.Scan() {
 				select {
 				case lines <- scanner.Text():
-				case <-ctx.Done():
+				case <-playCtx.Done():
 					return
 				}
 			}
 			if err := scanner.Err(); err != nil {
-				fmt.Fprintln(os.Stderr, "tacet-dmr: interactive input disabled:", err)
+				fmt.Fprintln(errOut, "tacet-dmr: interactive input disabled:", err)
 			}
 		}()
 	}
-	return play(ctx, p, tracks, commands, out)
+	return play(playCtx, p, tracks, commands, out)
 }
 
 func mediaSource(raw string) (string, error) {

@@ -127,4 +127,16 @@ func TestDeviceAcceptsOnlyConfiguredControllerAndHost(t *testing.T) {
 			t.Errorf("%+v: %d", tc, w.Code)
 		}
 	}
+	if !validHost("192.168.1.32", "192.168.1.32:80") || !validHost("192.168.1.32:80", "192.168.1.32:80") || validHost("192.168.1.32", "192.168.1.32:8080") {
+		t.Fatal("validHost port-80 handling failed")
+	}
+	if u, ok := callbackURL("<http://192.168.1.42:5000/a><http://192.168.1.42:5001/b>", netip.MustParseAddr("192.168.1.42")); !ok || u != "http://192.168.1.42:5000/a" {
+		t.Fatalf("multi-URL callbackURL = (%q, %t)", u, ok)
+	}
+	if u, ok := callbackURL("<http://192.168.1.99:5000/a><http://192.168.1.42:5001/b>", netip.MustParseAddr("192.168.1.42")); !ok || u != "http://192.168.1.42:5001/b" {
+		t.Fatalf("multi-URL fallback callbackURL = (%q, %t)", u, ok)
+	}
+	if _, ok := callbackURL("<http://192.168.1.42:5000/a<bad>>", netip.MustParseAddr("192.168.1.42")); ok {
+		t.Fatal("malformed nested angle brackets accepted")
+	}
 }
