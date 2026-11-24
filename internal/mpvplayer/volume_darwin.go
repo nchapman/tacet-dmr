@@ -206,6 +206,19 @@ func OpenVolumeControl(device string, exclusive bool) playback.VolumeControl {
 	return openCoreAudioVolume(&systemCoreAudio, uid)
 }
 
+// VolumeProber returns a probe for exclusive CoreAudio targets so USB DACs
+// connected after startup (such as headphone-activated dongles) attach to
+// CoreAudio hardware volume automatically once they appear.
+func VolumeProber(device string, exclusive bool) func() playback.VolumeControl {
+	uid, ok := coreAudioExclusiveUID(device, exclusive)
+	if !ok {
+		return nil
+	}
+	return func() playback.VolumeControl {
+		return openCoreAudioVolume(&systemCoreAudio, uid)
+	}
+}
+
 func coreAudioExclusiveUID(device string, exclusive bool) (string, bool) {
 	driver, uid, ok := strings.Cut(device, "/")
 	if !ok || uid == "" || uid == "default" {

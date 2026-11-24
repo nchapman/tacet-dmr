@@ -24,13 +24,16 @@ import (
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout); err != nil && !errors.Is(err, flag.ErrHelp) {
+	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil && !errors.Is(err, flag.ErrHelp) {
 		fmt.Fprintln(os.Stderr, "tacet-dmr:", err)
 		os.Exit(1)
 	}
 }
 
-var openVolumeControl = mpvplayer.OpenVolumeControl
+var (
+	openVolumeControl = mpvplayer.OpenVolumeControl
+	volumeProber      = mpvplayer.VolumeProber
+)
 
 func configureLocalVolume(setSoft func(int) error, vol playback.VolumeControl, initial *int, exclusive bool) error {
 	if vol != nil {
@@ -56,15 +59,13 @@ func configureLocalVolume(setSoft func(int) error, vol playback.VolumeControl, i
 	return nil
 }
 
-func configureServerVolume(c *renderer.Config, vol playback.VolumeControl, exclusive bool) {
+func configureServerVolume(c *renderer.Config, vol playback.VolumeControl, probe func() playback.VolumeControl, exclusive bool) {
+	c.Exclusive = exclusive
 	c.Volume = vol
-	if exclusive && c.Volume == nil && c.InitialVolume == nil {
-		level := 30
-		c.InitialVolume = &level
-	}
+	c.ProbeVolume = probe
 }
 
-func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error {
+func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) error {
 	fs := flag.NewFlagSet("tacet-dmr", flag.ContinueOnError)
 	list := fs.Bool("list-devices", false, "list audio output device IDs and exit")
 	device := fs.String("device", "", "mpv output device ID (default: automatic)")
@@ -79,13 +80,13 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 		server.InitialVolume = &v
 		return nil
 	})
-	fs.StringVar(&server.Listen, "serve", "", "host a UPnP renderer on this LAN IPv4:port")
+	fs.StringVar(&server.Listen, "serve", "", "host a UPnP renderer on this LAN IPv4:port or interface:port (e.g. en0:49152)")
 	fs.StringVar(&server.Controller, "controller", "", "trusted controller IPv4 or LAN CIDR, e.g. 192.168.1.0/24 (required with -serve)")
 	fs.StringVar(&server.Name, "name", "Tacet Renderer", "UPnP friendly name")
 	fs.StringVar(&server.UUID, "uuid", "", "override stable renderer UUID (default: derived from hostname)")
 	fs.BoolVar(&server.NoSSDP, "no-ssdp", false, "disable multicast discovery; use the printed description URL")
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: tacet-dmr [flags] FILE-OR-HTTP-URL ...\n       tacet-dmr -serve LAN-IP:PORT -controller TACET-IP [flags]")
+		fmt.Fprintln(fs.Output(), "Usage: tacet-dmr [flags] FILE-OR-HTTP-URL ...\n       tacet-dmr -serve LAN-IP-OR-IFACE:PORT -controller TACET-IP [flags]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -95,7 +96,8 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 		if *list || *interactive || fs.NArg() != 0 {
 			return errors.New("-serve cannot be combined with local tracks, -interactive or -list-devices")
 		}
-		configureServerVolume(&server, openVolumeControl(*device, *excl), *excl)
+		server.Log = errOut
+		configureServerVolume(&server, openVolumeControl(*device, *excl), volumeProber(*device, *excl), *excl)
 		return renderer.Serve(ctx, server, func() (renderer.Engine, error) { return mpvplayer.OpenNetwork(*device, *excl) }, out)
 	}
 	if *list && fs.NArg() != 0 {

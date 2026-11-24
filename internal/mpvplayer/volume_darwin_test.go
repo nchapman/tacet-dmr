@@ -233,4 +233,13 @@ func TestOpenVolumeControlReturnsNilForNonExclusiveOrNull(t *testing.T) {
 	if vc := OpenVolumeControl("coreaudio/BuiltInSpeakerDevice", false); vc != nil {
 		t.Fatalf("shared coreaudio should use mpv default, got %v", vc)
 	}
+	if p := VolumeProber("null/", true); p != nil {
+		t.Fatal("null/ should not return a volume prober")
+	}
+	if p := VolumeProber("coreaudio/BuiltInSpeakerDevice", false); p != nil {
+		t.Fatal("shared coreaudio should not return a volume prober")
+	}
+	if p := VolumeProber("coreaudio/BuiltInSpeakerDevice", true); p == nil {
+		t.Fatal("exclusive coreaudio should return a hotplug volume prober")
+	}
 }

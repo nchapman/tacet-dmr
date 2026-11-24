@@ -3,6 +3,8 @@ package renderer
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/url"
 	"strconv"
 	"strings"
@@ -32,13 +34,30 @@ type fault struct {
 var invalid = &fault{402, "Invalid Args"}
 var failed = &fault{501, "Action Failed"}
 
+type deviceOptions struct {
+	exclusive     bool
+	initialVolume *int
+	volume        playback.VolumeControl
+	probeVolume   func() playback.VolumeControl
+	log           io.Writer
+}
+
+type outputReport struct {
+	output                 string
+	sourceRate, outputRate int
+}
+
 // The renderer owns queue order; an engine session holds just the active entry
 // and the next natural successor. Explicit jumps/stops retire the whole session.
 type transport struct {
 	open                  Factory
 	p                     Engine
 	vol                   playback.VolumeControl // nil: mpv handles volume and mute (default)
-	active                int64
+	probeVol              func() playback.VolumeControl
+	nextProbe             time.Time
+	volOffline            bool
+	applyInitialToHW      bool // explicit -volume pending until hotplugged hardware appears
+	active, loggedEntry   int64
 	next                  stagedEntry
 	ended                 bool // natural EOF received, waiting for successor to become playable
 	q                     playlist
@@ -46,6 +65,8 @@ type transport struct {
 	pos, duration         time.Duration
 	volume, initialVolume int
 	mute, hwMute          bool
+	logger                *log.Logger
+	lastOut               outputReport
 }
 
 func clampVolume(v int) int {
@@ -58,28 +79,48 @@ func clampVolume(v int) int {
 	return v
 }
 
-func newTransport(open Factory, initialVolume *int, vol playback.VolumeControl) *transport {
+func sanitizeURI(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	return u.String()
+}
+
+func newTransport(open Factory, opts deviceOptions) *transport {
 	v := 100
-	if initialVolume != nil {
-		v = clampVolume(*initialVolume)
+	if opts.exclusive {
+		v = 30
+	}
+	if opts.initialVolume != nil {
+		v = clampVolume(*opts.initialVolume)
 	}
 	t := &transport{
-		open:          open,
-		vol:           vol,
-		q:             playlist{mode: normal},
-		state:         "NO_MEDIA_PRESENT",
-		status:        "OK",
-		volume:        v,
-		initialVolume: v,
+		open:             open,
+		vol:              opts.volume,
+		probeVol:         opts.probeVolume,
+		applyInitialToHW: opts.initialVolume != nil && opts.volume == nil && opts.probeVolume != nil,
+		q:                playlist{mode: normal},
+		state:            "NO_MEDIA_PRESENT",
+		status:           "OK",
+		volume:           v,
+		initialVolume:    v,
 	}
-	if vol != nil {
-		if hwVol, err := vol.Volume(); err == nil {
+	if opts.log != nil {
+		t.logger = log.New(opts.log, "", log.LstdFlags)
+	}
+	if t.vol != nil {
+		if hwVol, err := t.vol.Volume(); err == nil {
 			t.volume = clampVolume(hwVol)
-			if initialVolume == nil {
+			if opts.initialVolume == nil {
 				t.initialVolume = t.volume
 			}
 		}
-		if hwMute, err := vol.Mute(); err == nil {
+		if hwMute, err := t.vol.Mute(); err == nil {
 			t.hwMute = true
 			t.mute = hwMute
 		}
@@ -87,12 +128,92 @@ func newTransport(open Factory, initialVolume *int, vol playback.VolumeControl) 
 	return t
 }
 
-func (t *transport) syncVolume() {
-	if t.vol == nil {
+func (t *transport) logf(format string, args ...any) {
+	if t.logger != nil {
+		t.logger.Printf(format, args...)
+	}
+}
+
+func (t *transport) logOutput() {
+	if t.p == nil {
 		return
 	}
-	if v, err := t.vol.Volume(); err == nil {
-		t.volume = clampVolume(v)
+	s := t.p.Status()
+	if s.Output == "" || s.SourceRate <= 0 || s.OutputRate <= 0 {
+		return
+	}
+	rep := outputReport{output: s.Output, sourceRate: s.SourceRate, outputRate: s.OutputRate}
+	if rep == t.lastOut {
+		return
+	}
+	t.lastOut = rep
+	t.logf("output: %s · %d Hz source → %d Hz output", rep.output, rep.sourceRate, rep.outputRate)
+}
+
+func (t *transport) attachVolume(vol playback.VolumeControl) {
+	t.vol = vol
+	t.volOffline = false
+	if m, err := vol.Mute(); err == nil {
+		t.hwMute = true
+		t.mute = m
+	} else {
+		t.hwMute = false
+	}
+	if t.applyInitialToHW {
+		t.applyInitialToHW = false
+		if err := vol.SetVolume(t.volume); err != nil {
+			t.logf("error: apply initial volume to %v: %v", vol, err)
+		} else if actual, err := vol.Volume(); err == nil {
+			t.volume = clampVolume(actual)
+		}
+	} else if hwVol, err := vol.Volume(); err == nil {
+		t.volume = clampVolume(hwVol)
+		t.initialVolume = t.volume
+	}
+	muteMode := "software"
+	if t.hwMute {
+		muteMode = "hardware"
+	}
+	t.logf("volume: attached %v (level=%d, mute=%s)", vol, t.volume, muteMode)
+}
+
+func (t *transport) syncVolume(force bool) {
+	if t.vol == nil {
+		if t.probeVol == nil {
+			return
+		}
+		if !force && time.Now().Before(t.nextProbe) {
+			return
+		}
+		t.nextProbe = time.Now().Add(time.Second)
+		if vol := t.probeVol(); vol != nil {
+			t.attachVolume(vol)
+		}
+		return
+	}
+	if t.volOffline && !force && time.Now().Before(t.nextProbe) {
+		return
+	}
+	v, err := t.vol.Volume()
+	if err != nil {
+		if !t.volOffline {
+			t.volOffline = true
+			t.logf("volume: %v unavailable: %v", t.vol, err)
+		}
+		t.nextProbe = time.Now().Add(time.Second)
+		return
+	}
+	t.volume = clampVolume(v)
+	if t.volOffline {
+		t.volOffline = false
+		if m, err := t.vol.Mute(); err == nil {
+			t.hwMute = true
+			t.mute = m
+		} else if errors.Is(err, playback.ErrUnsupported) {
+			t.hwMute = false
+		}
+		t.logf("volume: %v reconnected (level=%d)", t.vol, t.volume)
+		return
 	}
 	if t.hwMute {
 		if m, err := t.vol.Mute(); err == nil {
@@ -106,6 +227,8 @@ func (t *transport) release() {
 		t.p = nil
 	}
 	t.active = 0
+	t.loggedEntry = 0
+	t.lastOut = outputReport{}
 	t.next = stagedEntry{}
 	t.ended = false
 	t.state = "STOPPED"
@@ -120,10 +243,12 @@ func validURI(s string) bool {
 func (t *transport) play() error {
 	if t.p != nil {
 		if err := t.p.Pause(false); err != nil {
+			t.logf("error: resume playback: %v", err)
 			return err
 		}
 		if t.state == "PAUSED_PLAYBACK" {
 			t.state = "PLAYING"
+			t.logf("resume")
 		}
 		return nil
 	}
@@ -147,8 +272,10 @@ func (t *transport) selectTrack(i int, state string) *fault {
 	return nil
 }
 func (t *transport) openTrack(paused bool) error {
+	t.syncVolume(true)
 	p, err := t.open()
 	if err != nil {
+		t.logf("error: open playback: %v", err)
 		return err
 	}
 	t.p = p
@@ -181,6 +308,7 @@ func (t *transport) openTrack(paused bool) error {
 		err = p.Pause(false)
 	}
 	if err != nil {
+		t.logf("error: start track %s: %v", sanitizeURI(t.q.current().uri), err)
 		t.release()
 		return err
 	}
@@ -227,6 +355,7 @@ func (t *transport) call(service, name string, a fields) (fields, *fault) {
 	out, f := t.dispatch(service, name, a)
 	if f == nil && t.p != nil {
 		if err := t.syncNext(); err != nil {
+			t.logf("error: stage next track: %v", err)
 			t.fail()
 			return nil, failed
 		}
@@ -324,10 +453,17 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 			return nil, &fault{701, "Transition not available"}
 		}
 		if err := t.p.Pause(true); err != nil {
+			t.logf("error: pause playback: %v", err)
 			return nil, failed
+		}
+		if t.state != "PAUSED_PLAYBACK" {
+			t.logf("pause")
 		}
 		t.state = "PAUSED_PLAYBACK"
 	case "Stop":
+		if t.p != nil {
+			t.logf("stop")
+		}
 		t.release()
 		t.pos = 0
 		t.status = "OK"
@@ -361,15 +497,17 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 	case "GetTransportSettings":
 		return fields{"PlayMode": t.q.mode, "RecQualityMode": "NOT_IMPLEMENTED"}, nil
 	case "GetVolume":
-		t.syncVolume()
+		t.syncVolume(true)
 		return fields{"CurrentVolume": strconv.Itoa(t.volume)}, nil
 	case "SetVolume":
 		v, err := strconv.Atoi(a["DesiredVolume"])
 		if err != nil || v < 0 || v > 100 {
 			return nil, invalid
 		}
+		t.applyInitialToHW = false
 		if t.vol != nil {
-			if t.vol.SetVolume(v) != nil {
+			if err := t.vol.SetVolume(v); err != nil {
+				t.logf("error: volume write: %v", err)
 				return nil, failed
 			}
 			if actual, err := t.vol.Volume(); err == nil {
@@ -378,13 +516,16 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 				t.volume = v
 			}
 		} else {
-			if t.p != nil && t.p.SetVolume(v) != nil {
-				return nil, failed
+			if t.p != nil {
+				if err := t.p.SetVolume(v); err != nil {
+					t.logf("error: volume write: %v", err)
+					return nil, failed
+				}
 			}
 			t.volume = v
 		}
 	case "GetMute":
-		t.syncVolume()
+		t.syncVolume(true)
 		return fields{"CurrentMute": onOff(t.mute)}, nil
 	case "SetMute":
 		v, err := strconv.ParseBool(a["DesiredMute"])
@@ -392,7 +533,8 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 			return nil, invalid
 		}
 		if t.vol != nil && t.hwMute {
-			if t.vol.SetMute(v) != nil {
+			if err := t.vol.SetMute(v); err != nil {
+				t.logf("error: mute write: %v", err)
 				return nil, failed
 			}
 			if actual, err := t.vol.Mute(); err == nil {
@@ -401,8 +543,11 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 				t.mute = v
 			}
 		} else {
-			if t.p != nil && t.p.SetMute(v) != nil {
-				return nil, failed
+			if t.p != nil {
+				if err := t.p.SetMute(v); err != nil {
+					t.logf("error: mute write: %v", err)
+					return nil, failed
+				}
 			}
 			t.mute = v
 		}

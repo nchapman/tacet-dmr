@@ -99,7 +99,7 @@ func TestDefaultVolumeUsesEngine(t *testing.T) {
 	tpt := newTransport(func() (Engine, error) {
 		eng = &volumeEngine{queueEngine: queueEngine{entries: make(map[int64]string)}}
 		return eng, nil
-	}, &level, nil)
+	}, deviceOptions{initialVolume: &level})
 
 	out, f := tpt.call(rc, "GetVolume", fields{"InstanceID": "0", "Channel": "Master"})
 	if f != nil || out["CurrentVolume"] != "30" {
@@ -135,7 +135,7 @@ func TestPlatformVolumeOverrideKeepsEngineAtUnity(t *testing.T) {
 	tpt := newTransport(func() (Engine, error) {
 		eng = &volumeEngine{queueEngine: queueEngine{entries: make(map[int64]string)}}
 		return eng, nil
-	}, nil, hw)
+	}, deviceOptions{volume: hw})
 
 	// Startup reads current hardware level without overwriting it.
 	if len(hw.setCalls) != 0 {
@@ -208,7 +208,7 @@ func TestPlatformVolumeWithoutHardwareMuteFallsBackToEngineMute(t *testing.T) {
 	tpt := newTransport(func() (Engine, error) {
 		eng = &volumeEngine{queueEngine: queueEngine{entries: make(map[int64]string)}}
 		return eng, nil
-	}, nil, hw)
+	}, deviceOptions{volume: hw})
 
 	if _, f := tpt.call(rc, "SetMute", fields{"InstanceID": "0", "Channel": "Master", "DesiredMute": "1"}); f != nil {
 		t.Fatalf("SetMute before Play: %v", f)
@@ -249,7 +249,7 @@ func TestExternalHardwareVolumeChangePublishesGENA(t *testing.T) {
 	defer cb.Close()
 
 	srv := httptest.NewUnstartedServer(nil)
-	d := newDevice("Desk", "uuid:test", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.0/24"), nil, hw, nil)
+	d := newDevice("Desk", "uuid:test", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.0/24"), deviceOptions{volume: hw}, nil)
 	defer d.Close()
 	srv.Config.Handler = d
 	srv.Start()

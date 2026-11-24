@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/nchapman/tacet-dmr/internal/playback"
 )
 
 const soapNS = "http://schemas.xmlsoap.org/soap/envelope/"
@@ -30,11 +28,11 @@ type Device struct {
 }
 
 func New(name, udn, host string, peers netip.Prefix, initialVolume int, open Factory) *Device {
-	return newDevice(name, udn, host, peers, &initialVolume, nil, open)
+	return newDevice(name, udn, host, peers, deviceOptions{initialVolume: &initialVolume}, open)
 }
 
-func newDevice(name, udn, host string, peers netip.Prefix, initialVolume *int, vol playback.VolumeControl, open Factory) *Device {
-	t := newTransport(open, initialVolume, vol)
+func newDevice(name, udn, host string, peers netip.Prefix, opts deviceOptions, open Factory) *Device {
+	t := newTransport(open, opts)
 	d := &Device{host: host, peers: peers, mux: http.NewServeMux(), t: t, last: t.eventState(), subs: make(map[string]*subscription), done: make(chan struct{}), client: &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	document := func(path, body string) {
 		d.mux.HandleFunc("GET "+path, func(w http.ResponseWriter, _ *http.Request) {

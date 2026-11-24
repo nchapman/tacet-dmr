@@ -34,7 +34,7 @@ func TestMediaSources(t *testing.T) {
 }
 
 func TestHelpDoesNotRequireTracks(t *testing.T) {
-	if err := run(context.Background(), []string{"-help"}, nil, io.Discard); !errors.Is(err, flag.ErrHelp) {
+	if err := run(context.Background(), []string{"-help"}, nil, io.Discard, io.Discard); !errors.Is(err, flag.ErrHelp) {
 		t.Fatal(err)
 	}
 }
@@ -82,7 +82,7 @@ func TestQueueFileFailureIsNotReportedAsSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := run(context.Background(), []string{"-device=null/", path}, nil, &out); err == nil || !strings.Contains(err.Error(), "track 1") {
+	if err := run(context.Background(), []string{"-device=null/", path}, nil, &out, io.Discard); err == nil || !strings.Contains(err.Error(), "track 1") {
 		t.Fatalf("failed file: got %v (%s)", err, &out)
 	}
 }
@@ -156,28 +156,47 @@ func TestLocalVolumeWiring(t *testing.T) {
 func TestServeVolumeWiring(t *testing.T) {
 	hw := &stubVolumeControl{level: 19}
 	var withHW renderer.Config
-	configureServerVolume(&withHW, hw, true)
-	if withHW.Volume != hw || withHW.InitialVolume != nil {
+	configureServerVolume(&withHW, hw, nil, true)
+	if withHW.Volume != hw || withHW.InitialVolume != nil || !withHW.Exclusive {
 		t.Fatalf("hardware exclusive should preserve nil InitialVolume, got %+v", withHW)
 	}
 
 	var softExcl renderer.Config
-	configureServerVolume(&softExcl, nil, true)
+	configureServerVolume(&softExcl, nil, nil, true)
 	if softExcl.Volume != nil || softExcl.StartupVolume() != 30 {
 		t.Fatalf("software exclusive should default to 30, got %+v", softExcl)
 	}
 
 	// Exercise the full run(-serve) path with an injected hardware override.
-	prev := openVolumeControl
+	prevOpen := openVolumeControl
+	prevProbe := volumeProber
 	openVolumeControl = func(string, bool) playback.VolumeControl { return hw }
-	t.Cleanup(func() { openVolumeControl = prev })
+	volumeProber = func(string, bool) func() playback.VolumeControl { return nil }
+	t.Cleanup(func() {
+		openVolumeControl = prevOpen
+		volumeProber = prevProbe
+	})
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	var out bytes.Buffer
-	if err := run(ctx, []string{"-serve", "127.0.0.1:0", "-controller", "127.0.0.1", "-no-ssdp", "-exclusive"}, nil, &out); err != nil {
+	if err := run(ctx, []string{"-serve", "127.0.0.1:0", "-controller", "127.0.0.1", "-no-ssdp", "-exclusive"}, nil, &out, io.Discard); err != nil {
 		t.Fatalf("run(-serve): %v", err)
 	}
 	if len(hw.writes) != 0 || !strings.Contains(out.String(), "Volume: stub hardware") {
 		t.Fatalf("writes=%v out=%q", hw.writes, out.String())
+	}
+
+	// When the hardware device is absent at startup but a prober is active,
+	// startup announces it is watching for hardware and preserves nil InitialVolume.
+	openVolumeControl = func(string, bool) playback.VolumeControl { return nil }
+	volumeProber = func(string, bool) func() playback.VolumeControl { return func() playback.VolumeControl { return nil } }
+	out.Reset()
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	cancel2()
+	if err := run(ctx2, []string{"-serve", "127.0.0.1:0", "-controller", "127.0.0.1", "-no-ssdp", "-exclusive"}, nil, &out, io.Discard); err != nil {
+		t.Fatalf("run(-serve watching): %v", err)
+	}
+	if !strings.Contains(out.String(), "Volume: mpv software (watching for hardware device)") {
+		t.Fatalf("unexpected watching banner: %q", out.String())
 	}
 }

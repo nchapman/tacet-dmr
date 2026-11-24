@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,19 +21,94 @@ import (
 type Config struct {
 	Listen, Controller, Name, UUID string
 	NoSSDP                         bool
-	InitialVolume                  *int                   // nil: 100 for mpv software volume, or current device level when Volume is set
-	Volume                         playback.VolumeControl // nil: mpv handles volume and mute (default)
+	Exclusive                      bool                          // defaults software volume to 30 when InitialVolume is nil
+	InitialVolume                  *int                          // nil: 100 shared, 30 exclusive software, or current device level for hardware
+	Volume                         playback.VolumeControl        // nil: mpv handles volume and mute (default)
+	ProbeVolume                    func() playback.VolumeControl // optional hotplug probe when Volume is nil
+	Log                            io.Writer                     // optional operational log sink (nil disables logging)
 }
 
 func (c Config) StartupVolume() int {
 	if c.InitialVolume != nil {
 		return *c.InitialVolume
 	}
+	if c.Exclusive {
+		return 30
+	}
 	return 100
 }
 
 func lan(ip netip.Addr) bool {
 	return ip.Is4() && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast())
+}
+
+func systemInterface(name string) (net.Flags, []net.Addr, error) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return 0, nil, err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return 0, nil, err
+	}
+	return iface.Flags, addrs, nil
+}
+
+func resolveListen(listen string, lookup func(string) (net.Flags, []net.Addr, error)) (netip.AddrPort, error) {
+	if ap, err := netip.ParseAddrPort(listen); err == nil {
+		if !lan(ap.Addr()) {
+			return netip.AddrPort{}, errors.New("-serve requires a concrete private, link-local or loopback IPv4:port or interface:port, not a wildcard")
+		}
+		return ap, nil
+	}
+	host, portStr, err := net.SplitHostPort(listen)
+	if err != nil || host == "" {
+		return netip.AddrPort{}, errors.New("-serve requires a concrete private, link-local or loopback IPv4:port or interface:port, not a wildcard")
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return netip.AddrPort{}, errors.New("-serve requires a concrete private, link-local or loopback IPv4:port or interface:port, not a wildcard")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return netip.AddrPort{}, fmt.Errorf("-serve port %q must be 0–65535", portStr)
+	}
+	flags, addrs, err := lookup(host)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("-serve interface %q: %w", host, err)
+	}
+	if flags&net.FlagUp == 0 {
+		return netip.AddrPort{}, fmt.Errorf("-serve interface %q is down", host)
+	}
+	var best netip.Addr
+	rank := func(ip netip.Addr) int {
+		switch {
+		case ip.IsPrivate():
+			return 3
+		case ip.IsLinkLocalUnicast():
+			return 2
+		case ip.IsLoopback():
+			return 1
+		default:
+			return 0
+		}
+	}
+	for _, a := range addrs {
+		p, err := netip.ParsePrefix(a.String())
+		if err != nil {
+			continue
+		}
+		ip := p.Addr().Unmap()
+		if !lan(ip) {
+			continue
+		}
+		if !best.IsValid() || rank(ip) > rank(best) {
+			best = ip
+		}
+	}
+	if !best.IsValid() {
+		return netip.AddrPort{}, fmt.Errorf("-serve interface %q has no private, link-local or loopback IPv4 address", host)
+	}
+	return netip.AddrPortFrom(best, uint16(port)), nil
 }
 
 // A bare IP keeps the original single-controller policy. Require an explicit
@@ -135,9 +211,9 @@ func startSSDP(ip netip.Addr, udn, location string) (advertisements, error) {
 	return ads, nil
 }
 func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
-	ap, err := netip.ParseAddrPort(c.Listen)
-	if err != nil || !lan(ap.Addr()) {
-		return errors.New("-serve requires a concrete private, link-local or loopback IPv4:port, not a wildcard")
+	ap, err := resolveListen(c.Listen, systemInterface)
+	if err != nil {
+		return err
 	}
 	peers, err := controllerNetwork(c.Controller)
 	if err != nil {
@@ -154,8 +230,12 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if c.InitialVolume != nil && c.Volume != nil {
-		if err := c.Volume.SetVolume(*c.InitialVolume); err != nil {
+	vol := c.Volume
+	if vol == nil && c.ProbeVolume != nil {
+		vol = c.ProbeVolume()
+	}
+	if c.InitialVolume != nil && vol != nil {
+		if err := vol.SetVolume(*c.InitialVolume); err != nil {
 			return fmt.Errorf("set initial volume: %w", err)
 		}
 	}
@@ -166,7 +246,13 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	defer ln.Close()
 	host := ln.Addr().String()
 	location := "http://" + host + "/description.xml"
-	d := newDevice(c.Name, udn, host, peers, c.InitialVolume, c.Volume, open)
+	d := newDevice(c.Name, udn, host, peers, deviceOptions{
+		exclusive:     c.Exclusive,
+		initialVolume: c.InitialVolume,
+		volume:        vol,
+		probeVolume:   c.ProbeVolume,
+		log:           c.Log,
+	}, open)
 	defer d.Close()
 	srv := &http.Server{Handler: d, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 8 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 16 << 10}
 	defer srv.Close()
@@ -181,8 +267,10 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 		defer ads.close()
 	}
 	volumeBackend := "mpv software"
-	if c.Volume != nil {
-		volumeBackend = fmt.Sprint(c.Volume)
+	if vol != nil {
+		volumeBackend = fmt.Sprint(vol)
+	} else if c.ProbeVolume != nil {
+		volumeBackend = "mpv software (watching for hardware device)"
 	}
 	fmt.Fprintf(out, "%s (%s)\nTACET_RENDERER_URL=%s\nController: %s · SSDP enabled: %t · Volume: %s\n", c.Name, udn, location, peers, !c.NoSSDP, volumeBackend)
 	tick := time.NewTicker(12 * time.Minute)
