@@ -21,7 +21,7 @@ Use the printed address. Tacet's URL validator requires a private LAN IP, **even
 ## What works in renderer mode
 
 - **AVTransport:1**: set/clear an HTTP(S) track and its next URI with DIDL metadata; play, pause, stop, time seek, next and previous. Query media, position, available transport actions, and play mode. `SetPlayMode` accepts `NORMAL`, `REPEAT_ONE` and `REPEAT_ALL`. Playback errors are reported via `TransportStatus`; seek depends on a seekable source.
-- **RenderingControl:1**: software volume (0–100) and mute on `Master`.
+- **RenderingControl:1**: software volume (0–100) and mute on `Master`. The startup level is 30 with `-exclusive`, 100 otherwise, or an explicit `-volume 0..100`. `FactoryDefaults` restores that startup level. Track changes and Stop/Play retain the current setting. A reading of 100 means unity software gain, not maximum speaker or amplifier volume. In particular, mpv's CoreAudio exclusive output does not expose hardware volume control; the device may retain a lower gain while the macOS volume keys are unavailable.
 - **ConnectionManager:1**: sink protocol and static connection information. Conservative HTTP audio MIME list; no native DSD claim.
 - **GENA**: subscribe, initial notification, subsequent state changes, renewal and unsubscribe. Position is polled rather than pushed every second.
 

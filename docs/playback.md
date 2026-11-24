@@ -20,6 +20,8 @@ go build -tags nocgo -o tacet-dmr ./cmd/tacet-dmr
 
 Use `tacet-dmr.exe` on Windows. Supply the exact `coreaudio/<UID>` or `wasapi/<endpoint>` identifier for your device on macOS or Windows. Linux direct `alsa/hw:` PCMs may need to be selected manually (`aplay -l`); `default`, `plughw`, PipeWire and PulseAudio are not accepted for the explicit exclusive request. Device auto-selection/shared output is fine without `-exclusive`. Arguments are individual tracks in playback order, not playlist files. In interactive mode, enter `play`, `pause`, `seek 1m20s`, `status`, or `stop`; Ctrl-C also stops playback.
 
+Use `-volume N` for initial software volume (0–100): the default is 30 in exclusive mode and 100 in shared mode. This does not change the system or DAC volume. For built-in Mac speakers, stop exclusive playback before adjusting the macOS output level, then resume at low software volume.
+
 Tracks are queued on one libmpv handle before unpausing. `gapless-audio=weak` favors seamless same-format transitions without forcing later tracks to use the first track's rate. Position and format reports are from the engine, not measurements at the DAC. Native DSD, sample-perfect joins, and a physical device lock are **not** certified. In particular, requesting CoreAudio hog mode is not independent proof that the driver granted it. No software drift correction, group playback, or automatic fallback to silent output is configured.
 
 ## Verification

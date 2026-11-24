@@ -19,6 +19,14 @@ import (
 type Config struct {
 	Listen, Controller, Name, UUID string
 	NoSSDP                         bool
+	InitialVolume                  *int // nil preserves unity gain for shared playback
+}
+
+func (c Config) StartupVolume() int {
+	if c.InitialVolume != nil {
+		return *c.InitialVolume
+	}
+	return 100
 }
 
 func lan(ip netip.Addr) bool {
@@ -133,6 +141,10 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	volume := c.StartupVolume()
+	if volume < 0 || volume > 100 {
+		return errors.New("initial volume must be 0–100")
+	}
 	if c.Name == "" {
 		return errors.New("renderer name cannot be empty")
 	}
@@ -147,7 +159,7 @@ func Serve(ctx context.Context, c Config, open Factory, out io.Writer) error {
 	defer ln.Close()
 	host := ln.Addr().String()
 	location := "http://" + host + "/description.xml"
-	d := New(c.Name, udn, host, peers, open)
+	d := New(c.Name, udn, host, peers, volume, open)
 	defer d.Close()
 	srv := &http.Server{Handler: d, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 8 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 16 << 10}
 	defer srv.Close()

@@ -35,20 +35,20 @@ var failed = &fault{501, "Action Failed"}
 // The renderer owns queue order; an engine session holds just the active entry
 // and the next natural successor. Explicit jumps/stops retire the whole session.
 type transport struct {
-	open          Factory
-	p             Engine
-	active        int64
-	next          stagedEntry
-	ended         bool // natural EOF received, waiting for successor to become playable
-	q             playlist
-	state, status string
-	pos, duration time.Duration
-	volume        int
-	mute          bool
+	open                  Factory
+	p                     Engine
+	active                int64
+	next                  stagedEntry
+	ended                 bool // natural EOF received, waiting for successor to become playable
+	q                     playlist
+	state, status         string
+	pos, duration         time.Duration
+	volume, initialVolume int
+	mute                  bool
 }
 
-func newTransport(open Factory) *transport {
-	return &transport{open: open, q: playlist{mode: normal}, state: "NO_MEDIA_PRESENT", status: "OK", volume: 100}
+func newTransport(open Factory, initialVolume int) *transport {
+	return &transport{open: open, q: playlist{mode: normal}, state: "NO_MEDIA_PRESENT", status: "OK", volume: initialVolume, initialVolume: initialVolume}
 }
 func (t *transport) release() {
 	if t.p != nil {
@@ -325,7 +325,7 @@ func (t *transport) dispatch(service, name string, a fields) (fields, *fault) {
 		if a["PresetName"] != "FactoryDefaults" {
 			return nil, invalid
 		}
-		if _, f := t.call(rc, "SetVolume", fields{"InstanceID": "0", "DesiredVolume": "100"}); f != nil {
+		if _, f := t.call(rc, "SetVolume", fields{"InstanceID": "0", "DesiredVolume": strconv.Itoa(t.initialVolume)}); f != nil {
 			return nil, f
 		}
 		return t.call(rc, "SetMute", fields{"InstanceID": "0", "DesiredMute": "0"})

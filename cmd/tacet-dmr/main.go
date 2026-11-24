@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +37,14 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 	excl := fs.Bool("exclusive", false, "request exclusive audio on a named native device")
 	interactive := fs.Bool("interactive", false, "read play/pause/seek/status/stop commands from stdin")
 	var server renderer.Config
+	fs.Func("volume", "initial software volume, 0–100 (default: 30 exclusive, 100 shared)", func(raw string) error {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 || v > 100 {
+			return errors.New("volume must be an integer from 0 to 100")
+		}
+		server.InitialVolume = &v
+		return nil
+	})
 	fs.StringVar(&server.Listen, "serve", "", "host a UPnP renderer on this LAN IPv4:port")
 	fs.StringVar(&server.Controller, "controller", "", "trusted controller IPv4 or LAN CIDR, e.g. 192.168.1.0/24 (required with -serve)")
 	fs.StringVar(&server.Name, "name", "Tacet Renderer", "UPnP friendly name")
@@ -47,6 +56,10 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *excl && server.InitialVolume == nil {
+		level := 30
+		server.InitialVolume = &level
 	}
 	if server.Listen != "" {
 		if *list || *interactive || fs.NArg() != 0 {
@@ -83,6 +96,9 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 			fmt.Fprintf(out, "%s\t%s\n", d.ID, d.Description)
 		}
 		return nil
+	}
+	if err := p.SetVolume(server.StartupVolume()); err != nil {
+		return fmt.Errorf("set initial volume: %w", err)
 	}
 	var commands <-chan string
 	if *interactive {

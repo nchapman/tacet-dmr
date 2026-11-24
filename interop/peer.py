@@ -14,6 +14,7 @@ from controlpoint import AV, ControlPoint, OriginRequester
 
 class PeerTest(unittest.IsolatedAsyncioTestCase):
     multicast = False
+    extra_args = ()
 
     async def asyncSetUp(self):
         binary = os.environ.get('DMR_TEST_BIN')
@@ -26,7 +27,7 @@ class PeerTest(unittest.IsolatedAsyncioTestCase):
         # overrides must never aim the mutation suite at someone's speakers.
         proc = await asyncio.create_subprocess_exec(
             binary, '-serve', '127.0.0.1:0', '-controller', '127.0.0.1', '-device', 'null/',
-            *([] if self.multicast else ['-no-ssdp']),
+            *([] if self.multicast else ['-no-ssdp']), *self.extra_args,
             stdout=asyncio.subprocess.PIPE, env=env)
         self.addAsyncCleanup(self.stop_process, proc)
         async with asyncio.timeout(8):

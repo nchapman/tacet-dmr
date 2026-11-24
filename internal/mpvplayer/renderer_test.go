@@ -20,7 +20,7 @@ import (
 // imitation of its SOAP messages. No dependency on a running Tacet or a DAC.
 func TestRendererWithAV1Controller(t *testing.T) {
 	srv := httptest.NewUnstartedServer(nil)
-	d := renderer.New("Study & DAC", "uuid:0ee23216-478e-49b5-9353-79741b89dd6b", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.1/32"), func() (renderer.Engine, error) { return OpenNetwork("null/", false) })
+	d := renderer.New("Study & DAC", "uuid:0ee23216-478e-49b5-9353-79741b89dd6b", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.1/32"), 100, func() (renderer.Engine, error) { return OpenNetwork("null/", false) })
 	defer d.Close()
 	srv.Config.Handler = d
 	srv.Start()

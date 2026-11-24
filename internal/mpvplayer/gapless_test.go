@@ -62,7 +62,7 @@ func TestNetworkJoinMatchesSourcePCM(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "capture.pcm")
 			srv := httptest.NewUnstartedServer(nil)
-			d := renderer.New("Capture", "uuid:fixture", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.1/32"), func() (renderer.Engine, error) {
+			d := renderer.New("Capture", "uuid:fixture", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.1/32"), 100, func() (renderer.Engine, error) {
 				p, err := OpenNetwork("pcm/", false)
 				if err != nil {
 					return nil, err

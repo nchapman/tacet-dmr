@@ -27,8 +27,8 @@ type Device struct {
 	closed bool
 }
 
-func New(name, udn, host string, peers netip.Prefix, open Factory) *Device {
-	d := &Device{host: host, peers: peers, mux: http.NewServeMux(), t: newTransport(open), subs: make(map[string]*subscription), done: make(chan struct{}), client: &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+func New(name, udn, host string, peers netip.Prefix, initialVolume int, open Factory) *Device {
+	d := &Device{host: host, peers: peers, mux: http.NewServeMux(), t: newTransport(open, initialVolume), subs: make(map[string]*subscription), done: make(chan struct{}), client: &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	document := func(path, body string) {
 		d.mux.HandleFunc("GET "+path, func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", `text/xml; charset="utf-8"`)

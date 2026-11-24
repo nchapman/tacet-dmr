@@ -28,7 +28,7 @@ func TestGENALifecycle(t *testing.T) {
 	}))
 	defer cb.Close()
 	srv := httptest.NewUnstartedServer(nil)
-	d := New("Desk", "uuid:test", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.0/24"), nil)
+	d := New("Desk", "uuid:test", srv.Listener.Addr().String(), netip.MustParsePrefix("127.0.0.0/24"), 100, nil)
 	defer d.Close()
 	srv.Config.Handler = d
 	srv.Start()
@@ -112,7 +112,7 @@ func TestGENALifecycle(t *testing.T) {
 }
 
 func TestDeviceAcceptsOnlyConfiguredControllerAndHost(t *testing.T) {
-	d := New("Desk", "uuid:test", "192.168.1.12:8088", netip.MustParsePrefix("192.168.1.42/32"), nil)
+	d := New("Desk", "uuid:test", "192.168.1.12:8088", netip.MustParsePrefix("192.168.1.42/32"), 100, nil)
 	defer d.Close()
 	for _, tc := range []struct {
 		remote, host, origin string
