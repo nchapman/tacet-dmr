@@ -39,8 +39,10 @@ func (c Config) StartupVolume() int {
 	return 100
 }
 
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
 func lan(ip netip.Addr) bool {
-	return ip.Is4() && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast())
+	return ip.Is4() && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || cgnatPrefix.Contains(ip))
 }
 
 func systemInterface(name string) (net.Flags, []net.Addr, error) {
@@ -83,7 +85,7 @@ func resolveListen(listen string, lookup func(string) (net.Flags, []net.Addr, er
 	var best netip.Addr
 	rank := func(ip netip.Addr) int {
 		switch {
-		case ip.IsPrivate():
+		case ip.IsPrivate() || cgnatPrefix.Contains(ip):
 			return 3
 		case ip.IsLinkLocalUnicast():
 			return 2
@@ -119,7 +121,7 @@ func controllerNetwork(raw string) (netip.Prefix, error) {
 		return netip.PrefixFrom(ip, 32), nil
 	}
 	if p, err := netip.ParsePrefix(raw); err == nil && p == p.Masked() {
-		for _, block := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8"} {
+		for _, block := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8"} {
 			local := netip.MustParsePrefix(block)
 			if p.Bits() >= local.Bits() && local.Contains(p.Addr()) {
 				return p, nil

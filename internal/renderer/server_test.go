@@ -43,6 +43,7 @@ func TestResolveListen(t *testing.T) {
 		addrs []net.Addr
 	}{
 		"en0":  {net.FlagUp | net.FlagMulticast, []net.Addr{cidr("fe80::1/64"), cidr("169.254.10.2/16"), cidr("192.168.68.71/22")}},
+		"ts0":  {net.FlagUp, []net.Addr{cidr("100.88.248.12/32")}},
 		"ll0":  {net.FlagUp, []net.Addr{cidr("169.254.10.2/16")}},
 		"lo0":  {net.FlagUp | net.FlagLoopback, []net.Addr{cidr("::1/128"), cidr("127.0.0.1/8")}},
 		"down": {0, []net.Addr{cidr("192.168.1.10/24")}},
@@ -61,8 +62,11 @@ func TestResolveListen(t *testing.T) {
 		want   string
 	}{
 		{"192.168.68.71:49152", "192.168.68.71:49152"},
+		{"100.88.248.12:49152", "100.88.248.12:49152"},
 		{"127.0.0.1:0", "127.0.0.1:0"},
 		{"en0:49152", "192.168.68.71:49152"},
+		{"ts0:49152", "100.88.248.12:49152"},
+		{"100.128.0.1:49152", ""},
 		{"ll0:49152", "169.254.10.2:49152"},
 		{"lo0:0", "127.0.0.1:0"},
 		{":49152", ""},
