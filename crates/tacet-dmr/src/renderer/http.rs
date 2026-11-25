@@ -727,7 +727,7 @@ mod tests {
             EngineConfig {
                 audio_device: "null".into(),
                 exclusive: false,
-                initial_volume: 100,
+                initial_volume: None,
             },
             true,
         )

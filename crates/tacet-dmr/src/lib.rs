@@ -140,10 +140,9 @@ pub async fn serve<W: Write>(
     validate_target(&cfg.audio_device)?;
 
     let exclusive = is_exclusive_target(&cfg.audio_device, cfg.exclusive);
-    let initial_volume = cfg
-        .initial_volume
-        .unwrap_or(if exclusive { 30 } else { 100 });
-    if initial_volume > 100 {
+    if let Some(v) = cfg.initial_volume
+        && v > 100
+    {
         return Err("initial volume must be 0-100".into());
     }
 
@@ -151,7 +150,7 @@ pub async fn serve<W: Write>(
         EngineConfig {
             audio_device: cfg.audio_device.clone(),
             exclusive,
-            initial_volume,
+            initial_volume: cfg.initial_volume,
         },
         cfg.quiet,
     )?;

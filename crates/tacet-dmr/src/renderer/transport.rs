@@ -37,14 +37,9 @@ pub struct Transport {
 impl Transport {
     pub fn new(cfg: EngineConfig, quiet: bool) -> Result<Self, String> {
         let default_volume = if cfg.exclusive { 30 } else { 100 };
-        let initial_vol = cfg.initial_volume.min(100);
         let (player, events) = Player::new(cfg)?;
         let st = player.status();
-        let volume = if st.volume <= 100 {
-            st.volume
-        } else {
-            initial_vol
-        };
+        let volume = st.volume.min(100);
         Ok(Self {
             player,
             events,
@@ -788,7 +783,7 @@ mod tests {
             EngineConfig {
                 audio_device: "null".into(),
                 exclusive,
-                initial_volume: if exclusive { 30 } else { 100 },
+                initial_volume: None,
             },
             true,
         )

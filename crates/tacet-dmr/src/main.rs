@@ -208,11 +208,10 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     let exclusive = is_exclusive_target(&device, args.exclusive);
-    let initial_volume = args.volume.unwrap_or(if exclusive { 30 } else { 100 });
     let (player, rx) = match Player::new(EngineConfig {
         audio_device: device,
         exclusive,
-        initial_volume,
+        initial_volume: args.volume,
     }) {
         Ok(p) => p,
         Err(e) => {

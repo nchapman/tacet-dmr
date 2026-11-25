@@ -15,6 +15,11 @@ use crate::format::{PcmSpec, volume_gain_q16};
 use crate::sink::{self, ActiveOutput, HardwareVolume, OutputStream, StreamShared};
 
 /// Configuration for creating a [`Player`].
+/// Safe default volume cap (0..=100) applied on startup in exclusive mode
+/// when no explicit initial volume is requested, so a USB DAC left at 100%
+/// never blasts full-scale audio into headphones or speakers.
+pub const EXCLUSIVE_SAFE_VOLUME: u8 = 30;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Target audio device (e.g. `"auto"`, `"null"`, `"pcm/out.raw"`,
@@ -23,8 +28,11 @@ pub struct EngineConfig {
     /// Request exclusive hardware mode (macOS CoreAudio hog mode, Linux ALSA
     /// `hw:`, Windows WASAPI Exclusive).
     pub exclusive: bool,
-    /// Initial software/hardware volume (0..=100).
-    pub initial_volume: u8,
+    /// Optional explicit initial software/hardware volume (0..=100).
+    /// When `None`, shared mode preserves hardware volume (or 100% software)
+    /// and exclusive mode caps hardware volume at [`EXCLUSIVE_SAFE_VOLUME`]
+    /// (or starts software volume at [`EXCLUSIVE_SAFE_VOLUME`]).
+    pub initial_volume: Option<u8>,
 }
 
 impl Default for EngineConfig {
@@ -32,7 +40,7 @@ impl Default for EngineConfig {
         Self {
             audio_device: "auto".into(),
             exclusive: false,
-            initial_volume: 100,
+            initial_volume: None,
         }
     }
 }
@@ -187,6 +195,54 @@ fn apply_output_gain(st: &mut PlayerInner) -> i64 {
     volume_gain_q16(st.volume, st.muted)
 }
 
+/// Determine initial `(volume, muted)` on startup and apply hardware volume
+/// when explicitly requested or when exclusive mode must cap a loud device.
+fn resolve_initial_volume(
+    initial_volume: Option<u8>,
+    exclusive: bool,
+    hw_vol: Option<&dyn HardwareVolume>,
+) -> (u8, bool) {
+    let mut muted = false;
+    match initial_volume {
+        Some(explicit) => {
+            let v = explicit.min(100);
+            if let Some(hv) = hw_vol {
+                let _ = hv.set_volume(v);
+                if let Ok(m) = hv.get_mute() {
+                    muted = m;
+                }
+            }
+            (v, muted)
+        }
+        None => {
+            if let Some(hv) = hw_vol {
+                if let Ok(m) = hv.get_mute() {
+                    muted = m;
+                }
+                match hv.get_volume() {
+                    Ok(cur) if exclusive && cur > EXCLUSIVE_SAFE_VOLUME => {
+                        let _ = hv.set_volume(EXCLUSIVE_SAFE_VOLUME);
+                        (EXCLUSIVE_SAFE_VOLUME, muted)
+                    }
+                    Ok(cur) => (cur, muted),
+                    Err(_) => (
+                        if exclusive {
+                            EXCLUSIVE_SAFE_VOLUME
+                        } else {
+                            100
+                        },
+                        muted,
+                    ),
+                }
+            } else if exclusive {
+                (EXCLUSIVE_SAFE_VOLUME, false)
+            } else {
+                (100, false)
+            }
+        }
+    }
+}
+
 impl Player {
     /// Create a new [`Player`] and return `(player, event_receiver)`.
     pub fn new(cfg: EngineConfig) -> Result<(Self, Receiver<PlaybackEvent>), String> {
@@ -195,16 +251,8 @@ impl Player {
         let exclusive = sink::is_exclusive_target(&cfg.audio_device, cfg.exclusive);
         let hw_vol = sink::open_hardware_volume(&cfg.audio_device, exclusive);
 
-        let mut volume = cfg.initial_volume.min(100);
-        let mut muted = false;
-        if let Some(hv) = &hw_vol {
-            if let Ok(v) = hv.get_volume() {
-                volume = v;
-            }
-            if let Ok(m) = hv.get_mute() {
-                muted = m;
-            }
-        }
+        let (volume, muted) =
+            resolve_initial_volume(cfg.initial_volume, exclusive, hw_vol.as_deref());
 
         let player = Self {
             cfg,
@@ -1104,7 +1152,7 @@ mod tests {
         let (player, rx) = Player::new(EngineConfig {
             audio_device: "null".into(),
             exclusive: false,
-            initial_volume: 80,
+            initial_volume: Some(80),
         })
         .unwrap();
 
@@ -1148,7 +1196,7 @@ mod tests {
         let (player, rx) = Player::new(EngineConfig {
             audio_device: format!("pcm/{}", pcm_out.display()),
             exclusive: false,
-            initial_volume: 100,
+            initial_volume: Some(100),
         })
         .unwrap();
 
@@ -1239,7 +1287,7 @@ mod tests {
         let (player, rx) = Player::new(EngineConfig {
             audio_device: "null".into(),
             exclusive: false,
-            initial_volume: 100,
+            initial_volume: Some(100),
         })
         .unwrap();
 
@@ -1290,7 +1338,7 @@ mod tests {
         let (player, rx) = Player::new(EngineConfig {
             audio_device: "null".into(),
             exclusive: false,
-            initial_volume: 100,
+            initial_volume: Some(100),
         })
         .unwrap();
 
@@ -1347,5 +1395,77 @@ mod tests {
         shared.maybe_flush(&mut cons);
         assert_eq!(shared.flush_ack.load(Ordering::Acquire), g2);
         assert_eq!(cons.slots(), 0);
+    }
+
+    #[test]
+    fn exclusive_initial_volume_caps_loud_hardware_and_preserves_quiet_hardware() {
+        use std::sync::atomic::AtomicU8;
+        struct MockHw {
+            vol: AtomicU8,
+            writes: Mutex<Vec<u8>>,
+        }
+        impl HardwareVolume for MockHw {
+            fn get_volume(&self) -> Result<u8, String> {
+                Ok(self.vol.load(Ordering::Relaxed))
+            }
+            fn set_volume(&self, v: u8) -> Result<(), String> {
+                self.vol.store(v, Ordering::Relaxed);
+                self.writes.lock().unwrap().push(v);
+                Ok(())
+            }
+            fn get_mute(&self) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn set_mute(&self, _m: bool) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        // Exclusive + loud hardware (100%) -> capped down to EXCLUSIVE_SAFE_VOLUME (30%).
+        let loud = MockHw {
+            vol: AtomicU8::new(100),
+            writes: Mutex::new(Vec::new()),
+        };
+        assert_eq!(resolve_initial_volume(None, true, Some(&loud)), (30, false));
+        assert_eq!(*loud.writes.lock().unwrap(), vec![30]);
+
+        // Exclusive + already-quiet hardware (18%) -> preserved without turning up.
+        let quiet = MockHw {
+            vol: AtomicU8::new(18),
+            writes: Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            resolve_initial_volume(None, true, Some(&quiet)),
+            (18, false)
+        );
+        assert!(quiet.writes.lock().unwrap().is_empty());
+
+        // Exclusive + no hardware volume -> conservative 30% software gain.
+        assert_eq!(resolve_initial_volume(None, true, None), (30, false));
+
+        // Shared + loud hardware (85%) -> preserved untouched.
+        let shared = MockHw {
+            vol: AtomicU8::new(85),
+            writes: Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            resolve_initial_volume(None, false, Some(&shared)),
+            (85, false)
+        );
+        assert!(shared.writes.lock().unwrap().is_empty());
+
+        // Shared + no hardware volume -> 100% unity software gain.
+        assert_eq!(resolve_initial_volume(None, false, None), (100, false));
+
+        // Explicit initial_volume overrides hardware even when > 30%.
+        let explicit = MockHw {
+            vol: AtomicU8::new(100),
+            writes: Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            resolve_initial_volume(Some(55), true, Some(&explicit)),
+            (55, false)
+        );
+        assert_eq!(*explicit.writes.lock().unwrap(), vec![55]);
     }
 }

@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "tacet-audio"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "alsa",
  "core-foundation",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "tacet-dmr"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "http-body-util",
