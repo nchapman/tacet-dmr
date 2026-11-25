@@ -87,12 +87,8 @@ pub fn open_stream(
 ) -> Result<Box<dyn OutputStream>, String> {
     let is_hw = name.starts_with("hw:");
     let c_name = CString::new(name).map_err(|_| format!("invalid ALSA device name {name:?}"))?;
-    let pcm = PCM::open(
-        c_name.to_str().unwrap_or("default"),
-        Direction::Playback,
-        false,
-    )
-    .map_err(|e| format!("ALSA open {name:?} failed: {e}"))?;
+    let pcm = PCM::open(&c_name, Direction::Playback, false)
+        .map_err(|e| format!("ALSA open {name:?} failed: {e}"))?;
 
     let (actual_rate, actual_ch, chosen_fmt, period_frames, can_pause) = {
         let hwp = HwParams::any(&pcm).map_err(|e| format!("ALSA HwParams::any: {e}"))?;
@@ -151,9 +147,7 @@ pub fn open_stream(
     let worker = thread::Builder::new()
         .name("tacet-alsa-sink".into())
         .spawn(move || {
-            let io = match pcm.io_bytes() {
-                io => io,
-            };
+            let io = pcm.io_bytes();
             let ch = actual_ch.max(1) as usize;
             let bps = chosen_fmt.bytes_per_sample();
             let frame_bytes = ch * bps;
