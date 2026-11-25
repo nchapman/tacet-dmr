@@ -1,47 +1,61 @@
 # tacet-dmr
 
-Play music from [Tacet](https://github.com/nchapman/tacet) on a DAC attached to another computer. `tacet-dmr` is a single-process Go UPnP audio renderer with an embedded libmpv playback engine. It supports Tacet’s native LinkPlay queue, one-track lookahead, volume, seek, and an optional exclusive-output request. It does not implement synchronized multiroom playback.
+A self-contained UPnP/LinkPlay audio renderer written in Rust. Exposes a local audio output (built-in speakers, USB DAC, ALSA `hw:`, or WASAPI endpoint) on your LAN so [Tacet](https://github.com/nchapman/tacet) — or any standard UPnP AV / LinkPlay control point — can discover it and play to it gaplessly.
 
-## Native binary
+## Workspace
 
-Download the archive for your OS and CPU from [Releases](https://github.com/nchapman/tacet-dmr/releases). CI also attaches `tacet-dmr-binaries` to successful [workflow runs](https://github.com/nchapman/tacet-dmr/actions). Archives include the executable and documentation, **not libmpv**. Install a matching-architecture libmpv 2 runtime (mpv 0.41 or 0.42); see [platform setup](docs/playback.md). Verify the download using the accompanying `SHA256SUMS`.
+- **`crates/tacet-audio`**: Reusable cross-platform audiophile playback engine (pure-Rust `symphonia` decoding, lock-free `rtrb` PCM ringbuffer, gapless track transitions, and native macOS CoreAudio HAL/AUHAL, Linux ALSA, and Windows WASAPI sinks). Designed for both `tacet-dmr` and direct in-process embedding in Tauri apps.
+- **`crates/tacet-dmr`**: UPnP/LinkPlay renderer library (`AVTransport:1`, `RenderingControl:1`, `ConnectionManager:1`, `PlayQueue:1`, GENA eventing, UDP multicast SSDP) and standalone CLI binary.
 
-- **macOS:** `darwin-arm64` for Apple Silicon, `darwin-amd64` for Intel. On Apple Silicon with Homebrew mpv, `export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix mpv)/lib"` is required so `libmpv.2.dylib` is found.
-- **Linux:** `linux-amd64` or `linux-arm64` for glibc-based systems. Ubuntu 26.04 provides `libmpv2`.
-- **Windows:** `windows-amd64` or `windows-arm64`. Put the matching libmpv DLL and its dependencies next to `tacet-dmr.exe`.
+## Features
 
-On the renderer machine, replace **both example addresses** with your own: `-serve` binds to the renderer’s LAN IPv4 address or interface name (e.g. `en0:49152`), and `-controller` allows the Tacet server’s IPv4 address or a trusted LAN subnet (e.g. `192.168.1.0/24`).
+- **Zero external media-player dependencies**: Single native binary with pure-Rust decoding for FLAC, ALAC, WAV, AIFF, CAF, MP3, AAC, Vorbis, Ogg, MP4/M4A, and WebM/Matroska (no `libmpv` or FFmpeg install required).
+- **Native audiophile output backends**:
+  - **macOS CoreAudio**: Shared mode via AUHAL, and true **exclusive hog mode** (`kAudioDevicePropertyHogMode`) via direct HAL `AudioDeviceCreateIOProcID` with per-track physical sample-rate switching, **native 3-byte packed 24-bit (`S24Packed`) support** for 24-bit-only USB DACs (such as the AudioQuest DragonFly Black), and native CoreAudio hardware volume/mute.
+  - **Linux ALSA**: Direct `hw:` / `plughw:` / `default` output supporting `S16_LE`, `S24_3LE`, `S24_LE`, `S32_LE`, and `FLOAT_LE`.
+  - **Windows WASAPI**: Exclusive and shared output (`S16`, `S24`, `S32`, `F32`) with `IAudioEndpointVolume`.
+- **Full single-room UPnP / LinkPlay surface**: All 4 services, all 6 LinkPlay `LoopMode` (`0..5`) / UPnP `PlayMode` modes, streaming `BrowseQueue`, GENA `SUBSCRIBE`/`NOTIFY`, and native SSDP discovery.
+- **Safety by default**: Explicit `-serve` LAN IP/interface binding, required `-controller` IPv4/CIDR allowlist, and conservative exclusive startup volume (`30` when software-controlled).
 
-```sh
-./tacet-dmr -list-devices
-./tacet-dmr -serve 192.168.1.32:49152 -controller 192.168.1.10 -name 'Study DAC'
-```
-
-Select **Study DAC** in Tacet. Add `-device` with an ID from the first command to select a specific output. Use only on a trusted LAN; this is not an authenticated internet service.
-
-## Linux container
-
-The image includes libmpv and supports `linux/amd64` and `linux/arm64`. The `dev` tag tracks `main`; versioned releases get version tags. If a newly created GHCR package is not yet public, authenticate or build locally with `docker build -t tacet-dmr .`.
+## Quick start
 
 ```sh
-# Native Linux host; pick the control node for the sound card you want.
-image=ghcr.io/nchapman/tacet-dmr:dev
-sound_gid=$(stat -c '%g' /dev/snd/controlC0)
-docker run --rm --device /dev/snd --group-add "$sound_gid" "$image" -list-devices
+# Build from source (requires Rust 1.85+; on Linux also libasound2-dev + pkg-config)
+cargo build --release --bin tacet-dmr
 
-docker run --rm --name tacet-dmr --hostname study-dac --network host \
-  --device /dev/snd --group-add "$sound_gid" "$image" \
-  -serve 192.168.1.32:49152 -controller 192.168.1.10 \
-  -device 'alsa/hw:CARD=DAC,DEV=0' -name 'Study DAC'
+# List available audio outputs
+./target/release/tacet-dmr -list-devices
+
+# Run as a UPnP / LinkPlay renderer on macOS with a USB DAC in exclusive hog mode
+./target/release/tacet-dmr \
+  -serve en0:49152 \
+  -controller 192.168.1.0/24 \
+  -name "Desk DAC" \
+  -device "coreaudio/<device-uid>" \
+  -exclusive
 ```
 
-Replace the ALSA ID with your device’s ID. Linux host networking lets SSDP multicast, SOAP, and callbacks use the real LAN interface. The image runs as a non-root user; `--privileged` is not required. For a silent test omit the sound-device and group flags and use `-device 'null/'`. Docker Desktop is not a substitute for native CoreAudio or WASAPI: use the native binary on macOS or Windows.
-
-## Development
+## Docker (Linux)
 
 ```sh
-sh scripts/check.sh        # vet, race tests, real libmpv and HTTP interoperability
-sh scripts/package.sh      # six archives plus SHA256SUMS in dist/ (needs zip and tar)
+docker run --rm --net=host --device /dev/snd \
+  ghcr.io/nchapman/tacet-dmr:dev \
+  -serve eth0:49152 \
+  -controller 192.168.1.0/24 \
+  -name "Linux DAC" \
+  -device alsa/default
 ```
 
-[Renderer setup and capabilities](docs/renderer.md) · [Playback and hardware qualification](docs/playback.md) · [Test suite](docs/testing.md). Pushing a `vMAJOR.MINOR.PATCH` tag (optionally with a prerelease suffix) runs CI, publishes the multi-platform GHCR image, and attaches the verified archives to a GitHub Release.
+## Testing
+
+```sh
+# Full local check: clippy, unit tests, 15-test Python UPnP/LinkPlay interop suite,
+# and (if ../tacet is present) unmodified sibling Tacet queue peer test
+DMR_TEST_IP="$(ipconfig getifaddr en0)" sh scripts/check.sh
+```
+
+See [`docs/renderer.md`](docs/renderer.md) for CLI flags, protocol details, and architecture notes.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

@@ -8,8 +8,10 @@ tacet=$(cd "${TACET_SRC:-$root/../tacet}" && pwd -P)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cd "$root"
-export DMR_TEST_BIN="$tmp/dmr"
-go build -tags nocgo -o "$DMR_TEST_BIN" ./cmd/tacet-dmr
+if [ -z "${DMR_TEST_BIN:-}" ]; then
+    cargo build --bin tacet-dmr
+    export DMR_TEST_BIN="$root/target/debug/tacet-dmr"
+fi
 python3 - "$tacet" "$root" "$tmp/overlay.json" <<'PY'
 import json, pathlib, sys
 tacet, root, output = map(pathlib.Path, sys.argv[1:])

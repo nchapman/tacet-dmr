@@ -23,10 +23,10 @@ class ActionTests(PeerTest):
         sinks = set(protocols['Sink'].split(','))
         for mime in ('audio/flac', 'audio/x-flac', 'audio/wav', 'audio/aiff', 'audio/mpeg',
                      'audio/aac', 'audio/mp4', 'audio/x-m4a', 'audio/alac', 'audio/ogg',
-                     'audio/opus', 'audio/webm', 'audio/dsf', 'audio/wavpack', 'audio/x-ape',
-                     'audio/x-ms-wma'):
+                     'audio/webm'):
             self.assertIn(f'http-get:*:{mime}:*', sinks)
-        self.assertNotIn('http-get:*:audio/L16:*', sinks)
+        for unsupported in ('audio/L16', 'audio/opus', 'audio/dsf', 'audio/wavpack', 'audio/x-ape', 'audio/x-ms-wma'):
+            self.assertNotIn(f'http-get:*:{unsupported}:*', sinks)
         ids = await self.cp.call(CM, 'GetCurrentConnectionIDs')
         self.assertEqual(ids['ConnectionIDs'], '0')
         connection = await self.cp.call(CM, 'GetCurrentConnectionInfo', ConnectionID=0)

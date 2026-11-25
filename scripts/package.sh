@@ -1,32 +1,63 @@
 #!/bin/sh
-# Build the same native-runtime-dependent CLI shipped in GitHub Releases.
+# Package a release archive for the current host (or specified TARGET / OS / ARCH).
 set -eu
-cd "$(dirname "$0")/.."
-export COPYFILE_DISABLE=1
-version=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
 out=${1:-dist}
+root=$(cd "$(dirname "$0")/.." && pwd -P)
+cd "$root"
+
+version=${VERSION:-$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo dev)}
+export TACET_DMR_VERSION="$version"
+
+target=${TARGET:-}
+if [ -n "$target" ]; then
+    cargo build --release --locked --bin tacet-dmr --target "$target"
+    bin_dir="target/$target/release"
+else
+    cargo build --release --locked --bin tacet-dmr
+    bin_dir="target/release"
+fi
+
+os=${PKG_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}
+arch=${PKG_ARCH:-$(uname -m)}
+case "$arch" in
+    x86_64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+esac
+
+ext=""
+if [ "$os" = "windows" ]; then
+    ext=".exe"
+fi
+
+name="tacet-dmr-$os-$arch"
 mkdir -p "$out"
-out=$(cd "$out" && pwd)
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-mkdir "$tmp/assets"
-for os in darwin linux windows; do
-    for arch in amd64 arm64; do
-        name=tacet-dmr-$os-$arch
-        dir=$tmp/$name
-        mkdir "$dir"
-        bin=tacet-dmr
-        if [ "$os" = windows ]; then bin=tacet-dmr.exe; fi
-        CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -tags nocgo -trimpath -ldflags="-s -w -X main.version=${version}" -o "$dir/$bin" ./cmd/tacet-dmr
-        cp LICENSE README.md "$dir/"
-        cp -R docs "$dir/"
-        if [ "$os" = windows ]; then
-            (cd "$tmp" && zip -qr "assets/$name.zip" "$name")
-        else
-            tar -czf "$tmp/assets/$name.tar.gz" -C "$tmp" "$name"
-        fi
-    done
-done
-(cd "$tmp/assets" && if command -v sha256sum >/dev/null; then sha256sum *.tar.gz *.zip; else shasum -a 256 *.tar.gz *.zip; fi) > "$tmp/assets/SHA256SUMS"
-rm -f "$out"/tacet-dmr-*.tar.gz "$out"/tacet-dmr-*.zip "$out/SHA256SUMS"
-cp "$tmp/assets/"* "$out/"
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+dir="$stage/$name"
+mkdir -p "$dir"
+cp "$bin_dir/tacet-dmr$ext" "$dir/tacet-dmr$ext"
+cp LICENSE README.md "$dir/"
+cp -R docs "$dir/"
+
+if [ "$os" = "windows" ]; then
+    if command -v 7z >/dev/null 2>&1; then
+        (cd "$stage" && 7z a -tzip -bso0 -bsp0 "$name.zip" "$name")
+    elif command -v zip >/dev/null 2>&1; then
+        (cd "$stage" && zip -q -r "$name.zip" "$name")
+    else
+        python3 - "$stage" "$name" <<'PY'
+import pathlib, sys, zipfile
+stage = pathlib.Path(sys.argv[1])
+name = sys.argv[2]
+with zipfile.ZipFile(stage / f"{name}.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+    for p in sorted((stage / name).rglob("*")):
+        if p.is_file():
+            zf.write(p, p.relative_to(stage))
+PY
+    fi
+    mv "$stage/$name.zip" "$out/$name.zip"
+else
+    COPYFILE_DISABLE=1 tar -C "$stage" -czf "$out/$name.tar.gz" "$name"
+fi
+
+echo "Packaged $out/$name"
