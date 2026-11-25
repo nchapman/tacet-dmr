@@ -500,11 +500,12 @@ fn buffer_capacity_samples(spec: PcmSpec) -> usize {
 }
 
 /// Request a ringbuffer flush on the sink and wait briefly for the sink to
-/// observe and complete it so post-seek samples are never discarded.
+/// acknowledge this exact generation so post-seek samples are never discarded
+/// and back-to-back flush requests can never be lost.
 fn wait_for_flush(shared: &StreamShared, cancel: &AtomicBool) {
-    shared.flush_ring.store(true, Ordering::Release);
+    let target = shared.flush_req.fetch_add(1, Ordering::Release) + 1;
     let deadline = std::time::Instant::now() + Duration::from_millis(200);
-    while shared.flush_ring.load(Ordering::Acquire)
+    while shared.flush_ack.load(Ordering::Acquire) < target
         && !cancel.load(Ordering::Relaxed)
         && !shared.is_failed()
         && std::time::Instant::now() < deadline

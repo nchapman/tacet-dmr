@@ -46,7 +46,8 @@ pub struct StreamShared {
     pub finished: AtomicBool,
     pub failed: AtomicBool,
     pub stop: AtomicBool,
-    pub flush_ring: AtomicBool,
+    pub flush_req: AtomicU64,
+    pub flush_ack: AtomicU64,
     pub gain_q16: AtomicI64,
     pub frames_played: AtomicU64,
     pub underruns: AtomicU64,
@@ -60,26 +61,28 @@ impl StreamShared {
             finished: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
-            flush_ring: AtomicBool::new(false),
+            flush_req: AtomicU64::new(0),
+            flush_ack: AtomicU64::new(0),
             gain_q16: AtomicI64::new(gain_q16),
             frames_played: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
         }
     }
 
-    /// If a seek flush was requested, discard all currently queued complete frames
-    /// in `consumer`, then clear `flush_ring` with Release ordering so the producer
-    /// waiting on `!flush_ring` sees the completed flush.
+    /// If a seek flush was requested, discard all currently queued samples in
+    /// `consumer` and publish the acknowledged generation with Release ordering
+    /// so back-to-back flush requests can never be lost.
     #[inline]
     pub fn maybe_flush(&self, consumer: &mut Consumer<i32>) {
-        if self.flush_ring.load(Ordering::Acquire) {
+        let req = self.flush_req.load(Ordering::Acquire);
+        if req != self.flush_ack.load(Ordering::Relaxed) {
             let n = consumer.slots();
             if n > 0
                 && let Ok(chunk) = consumer.read_chunk(n)
             {
                 chunk.commit_all();
             }
-            self.flush_ring.store(false, Ordering::Release);
+            self.flush_ack.store(req, Ordering::Release);
         }
     }
 
