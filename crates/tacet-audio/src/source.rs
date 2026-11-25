@@ -79,7 +79,8 @@ impl HttpMediaSource {
     fn open(url: &str, cancel: Arc<AtomicBool>) -> io::Result<Self> {
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
-            .timeout_recv_body(Some(HTTP_READ_TIMEOUT))
+            .timeout_recv_response(Some(HTTP_READ_TIMEOUT))
+            .timeout_per_read(Some(HTTP_READ_TIMEOUT))
             .build();
         let agent: ureq::Agent = config.into();
 
