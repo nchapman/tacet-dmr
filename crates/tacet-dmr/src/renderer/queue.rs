@@ -536,4 +536,50 @@ mod tests {
         );
         assert!(parse_context(&bad_count).is_err());
     }
+
+    #[test]
+    fn queue_mutations_preserve_selected_track_index() {
+        let mut q = Playlist {
+            name: "q".into(),
+            items: mk_tracks(4), // t1, t2, t3, t4
+            index: 2,            // currently t3
+            mode: NORMAL.into(),
+            ..Default::default()
+        };
+
+        // Removing inclusive index [0..=0] before current shifts index down by 1 -> still t3.
+        assert!(!q.remove(0, 0));
+        assert_eq!(q.index, 1);
+        assert!(q.current().uri.ends_with("/t3.flac"));
+
+        // Appending preserves current index -> still t3.
+        q.append_items(mk_tracks(1));
+        assert_eq!(q.index, 1);
+        assert!(q.current().uri.ends_with("/t3.flac"));
+
+        // Removing the current track itself reports true so transport can stop/advance.
+        assert!(q.remove(1, 1));
+    }
+
+    #[test]
+    fn repeat_modes_step_correctly_for_eof_and_manual() {
+        let mut q = Playlist {
+            name: "q".into(),
+            items: mk_tracks(3),
+            index: 2, // last track
+            mode: NORMAL.into(),
+            ..Default::default()
+        };
+        assert_eq!(q.step(1, true), None);
+        assert_eq!(q.step(-1, false), Some(1));
+
+        q.set_mode(REPEAT_ALL);
+        assert_eq!(q.step(1, true), Some(0));
+        q.index = 0;
+        assert_eq!(q.step(-1, false), Some(2));
+
+        q.set_mode(REPEAT_ONE);
+        assert_eq!(q.step(1, true), Some(0)); // EOF repeats current
+        assert_eq!(q.step(1, false), Some(1)); // Manual Next advances
+    }
 }

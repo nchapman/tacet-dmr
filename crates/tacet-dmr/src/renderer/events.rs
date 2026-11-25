@@ -352,3 +352,59 @@ async fn send_notify(
         Ok(Some(true))
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_seq_never_wraps_to_zero() {
+        assert_eq!(next_seq(0), 1);
+        assert_eq!(next_seq(1), 2);
+        assert_eq!(next_seq(u32::MAX), 1);
+    }
+
+    #[test]
+    fn event_state_changed_for_isolates_services() {
+        let a = EventState {
+            state: "STOPPED".into(),
+            status: "OK".into(),
+            volume: 30,
+            mute: false,
+            ..Default::default()
+        };
+        let mut b = a.clone();
+        b.volume = 55;
+        assert!(b.changed_for(RC, &a));
+        assert!(!b.changed_for(AV, &a));
+        assert!(!b.changed_for(CM, &a));
+
+        let mut c = a.clone();
+        c.state = "PLAYING".into();
+        assert!(c.changed_for(AV, &a));
+        assert!(!c.changed_for(RC, &a));
+    }
+
+    #[test]
+    fn expire_stale_removes_expired_and_signals_stop() {
+        let mut mgr = SubRegistry::new(EventState::default());
+        let (tx, _rx) = watch::channel(EventState::default());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let now = Instant::now();
+        mgr.subs.insert(
+            "uuid:expired".into(),
+            Subscription {
+                sid: "uuid:expired".into(),
+                service: AV.into(),
+                callback: "http://127.0.0.1:9999/cb".into(),
+                peer: "127.0.0.1".parse().unwrap(),
+                expires: now,
+                tx,
+                stop_tx,
+            },
+        );
+        mgr.expire_stale(now + Duration::from_secs(1));
+        assert!(mgr.subs.is_empty());
+        assert!(*stop_rx.borrow());
+    }
+}

@@ -86,3 +86,53 @@ pub fn format_browse_soap(snap: &BrowseSnapshot) -> String {
     out.push_str("</QueueContext></u:BrowseQueueResponse></s:Body></s:Envelope>");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::queue::{Track, parse_context};
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    #[test]
+    fn browse_soap_roundtrips_special_xml_chars_in_url_and_metadata() {
+        let snap = BrowseSnapshot {
+            list_name: "Mix & Match".into(),
+            total_count: 2,
+            is_total: false,
+            items: vec![
+                Track {
+                    uri: "http://10.0.0.1:8080/track?id=1&fmt=flac".into(),
+                    metadata: r#"<DIDL-Lite><item id="1"><dc:title>A &amp; B &lt;Live&gt;</dc:title></item></DIDL-Lite>"#.into(),
+                },
+                Track {
+                    uri: "http://10.0.0.1:8080/track?id=2&fmt=alac".into(),
+                    metadata: String::new(),
+                },
+            ],
+        };
+
+        let soap = format_browse_soap(&snap);
+        // Extract <QueueContext> text from the outer SOAP envelope using a real XML parser.
+        let mut reader = Reader::from_str(&soap);
+        let mut in_qc = false;
+        let mut qc = String::new();
+        loop {
+            match reader.read_event().unwrap() {
+                Event::Start(e) if e.local_name().as_ref() == b"QueueContext" => in_qc = true,
+                Event::End(e) if e.local_name().as_ref() == b"QueueContext" => break,
+                Event::Text(t) if in_qc => qc.push_str(&t.unescape().unwrap()),
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+
+        // Now parse the unescaped inner <PlayList> XML back through parse_context!
+        let (list_name, tracks) = parse_context(&qc).unwrap();
+        assert_eq!(list_name, "Mix & Match");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].uri, snap.items[0].uri);
+        assert_eq!(tracks[0].metadata, snap.items[0].metadata);
+        assert_eq!(tracks[1].uri, snap.items[1].uri);
+    }
+}

@@ -704,4 +704,119 @@ mod tests {
             None
         );
     }
+
+    #[tokio::test]
+    async fn http_enforces_subscription_cap_and_releases_on_unsubscribe() {
+        use hyper::client::conn::http1;
+        use tacet_audio::EngineConfig;
+        use tokio::net::TcpStream;
+
+        async fn send_req(
+            addr: SocketAddr,
+            req: Request<Full<Bytes>>,
+        ) -> Response<hyper::body::Incoming> {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            sender.send_request(req).await.unwrap()
+        }
+
+        let transport = Transport::new(
+            EngineConfig {
+                audio_device: "null".into(),
+                exclusive: false,
+                initial_volume: 100,
+            },
+            true,
+        )
+        .unwrap();
+        let dev = Device::new(
+            "Test Renderer".into(),
+            "uuid:11111111-1111-1111-1111-111111111111".into(),
+            ControllerFilter::parse("127.0.0.1").unwrap(),
+            transport,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let dev_srv = Arc::clone(&dev);
+        let srv = tokio::spawn(async move {
+            let _ = serve_http(listener, dev_srv, shutdown_rx).await;
+        });
+
+        // Open a dummy local listener so NOTIFY callbacks connect cleanly without blocking.
+        let cb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cb_addr = cb_listener.local_addr().unwrap();
+        let cb_task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = cb_listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let mut sids = Vec::new();
+        for _ in 0..MAX_SUBSCRIPTIONS {
+            let req = Request::builder()
+                .method(Method::from_bytes(b"SUBSCRIBE").unwrap())
+                .uri("/AVTransport/events")
+                .header("Host", addr.to_string())
+                .header("CALLBACK", format!("<http://{cb_addr}/cb>"))
+                .header("NT", "upnp:event")
+                .header("TIMEOUT", "Second-300")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = send_req(addr, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            sids.push(resp.headers()["SID"].to_str().unwrap().to_string());
+        }
+
+        // 65th subscription must be rejected with 503 Service Unavailable.
+        let req = Request::builder()
+            .method(Method::from_bytes(b"SUBSCRIBE").unwrap())
+            .uri("/AVTransport/events")
+            .header("Host", addr.to_string())
+            .header("CALLBACK", format!("<http://{cb_addr}/cb>"))
+            .header("NT", "upnp:event")
+            .header("TIMEOUT", "Second-300")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = send_req(addr, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Unsubscribing one frees a slot for a new subscription.
+        let unsub = Request::builder()
+            .method(Method::from_bytes(b"UNSUBSCRIBE").unwrap())
+            .uri("/AVTransport/events")
+            .header("Host", addr.to_string())
+            .header("SID", &sids[0])
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(send_req(addr, unsub).await.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .method(Method::from_bytes(b"SUBSCRIBE").unwrap())
+            .uri("/AVTransport/events")
+            .header("Host", addr.to_string())
+            .header("CALLBACK", format!("<http://{cb_addr}/cb>"))
+            .header("NT", "upnp:event")
+            .header("TIMEOUT", "Second-300")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(send_req(addr, req).await.status(), StatusCode::OK);
+
+        let _ = shutdown_tx.send(true);
+        cb_task.abort();
+        dev.close();
+        let _ = srv.await;
+    }
 }

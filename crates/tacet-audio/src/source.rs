@@ -265,3 +265,123 @@ impl MediaSource for HttpMediaSource {
         self.len
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+
+    /// Minimal single-purpose HTTP/1.1 range server for deterministic source tests.
+    fn spawn_range_server(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = Arc::clone(&hits);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let body = body.clone();
+                let hits = Arc::clone(&hits_bg);
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut range_start: Option<usize> = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(rest) = line.to_ascii_lowercase().strip_prefix("range: bytes=")
+                            && let Some((s, _)) = rest.trim().split_once('-')
+                        {
+                            range_start = s.parse().ok();
+                        }
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut w = stream;
+                    match range_start {
+                        Some(start) if start < body.len() => {
+                            let slice = &body[start..];
+                            let hdr = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                slice.len(),
+                                start,
+                                body.len() - 1,
+                                body.len()
+                            );
+                            let _ = w.write_all(hdr.as_bytes());
+                            let _ = w.write_all(slice);
+                        }
+                        Some(_) => {
+                            let _ = w.write_all(
+                                b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        None => {
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = w.write_all(hdr.as_bytes());
+                            let _ = w.write_all(&body);
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/track.bin"), hits)
+    }
+
+    #[test]
+    fn http_source_prefix_cache_range_seek_and_eof_clamp() {
+        // 300 KiB payload (> 256 KiB prefix cache so far seeks exercise Range requests).
+        let payload: Vec<u8> = (0..(300 * 1024)).map(|i| (i % 251) as u8).collect();
+        let (url, hits) = spawn_range_server(payload.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let mut src = open_media(&url, Arc::clone(&cancel)).unwrap().source;
+        assert_eq!(src.byte_len(), Some(payload.len() as u64));
+        assert!(src.is_seekable());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Read first 16 bytes, seek back to 0: served from prefix cache with no new HTTP request.
+        let mut buf = [0u8; 16];
+        src.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &payload[..16]);
+        src.seek(SeekFrom::Start(0)).unwrap();
+        src.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &payload[..16]);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Seek beyond prefix cache -> Range request.
+        let far = 280 * 1024;
+        src.seek(SeekFrom::Start(far as u64)).unwrap();
+        src.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &payload[far..far + 16]);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // Seek past EOF clamps to len and next read returns Ok(0) without issuing a 416 Range request!
+        let pos = src
+            .seek(SeekFrom::Start((payload.len() + 999) as u64))
+            .unwrap();
+        assert_eq!(pos, payload.len() as u64);
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // Cancellation returns Interrupted cleanly on both seek and read.
+        cancel.store(true, Ordering::Release);
+        assert_eq!(
+            src.seek(SeekFrom::Start(0)).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            src.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+}

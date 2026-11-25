@@ -782,4 +782,152 @@ mod tests {
         assert_eq!(parse_time("0:60:00"), None);
         assert_eq!(parse_time("0:00:NaN"), None);
     }
+
+    fn test_transport(exclusive: bool) -> Transport {
+        Transport::new(
+            EngineConfig {
+                audio_device: "null".into(),
+                exclusive,
+                initial_volume: if exclusive { 30 } else { 100 },
+            },
+            true,
+        )
+        .unwrap()
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> Fields {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn transport_exclusive_volume_safety_and_protocol_info_honesty() {
+        let mut tr = test_transport(true);
+        // Exclusive startup volume is conservative 30, not 100.
+        let r = tr
+            .call(
+                RC,
+                "GetVolume",
+                &fields(&[("InstanceID", "0"), ("Channel", "Master")]),
+            )
+            .unwrap();
+        assert_eq!(r["CurrentVolume"], "30");
+
+        // SetVolume + SetMute + FactoryDefault resets to conservative 30.
+        tr.call(
+            RC,
+            "SetVolume",
+            &fields(&[
+                ("InstanceID", "0"),
+                ("Channel", "Master"),
+                ("DesiredVolume", "75"),
+            ]),
+        )
+        .unwrap();
+        tr.call(
+            RC,
+            "SetMute",
+            &fields(&[
+                ("InstanceID", "0"),
+                ("Channel", "Master"),
+                ("DesiredMute", "1"),
+            ]),
+        )
+        .unwrap();
+        tr.call(
+            RC,
+            "SelectPreset",
+            &fields(&[("InstanceID", "0"), ("PresetName", "FactoryDefaults")]),
+        )
+        .unwrap();
+        let r = tr
+            .call(
+                RC,
+                "GetVolume",
+                &fields(&[("InstanceID", "0"), ("Channel", "Master")]),
+            )
+            .unwrap();
+        assert_eq!(r["CurrentVolume"], "30");
+        let r = tr
+            .call(
+                RC,
+                "GetMute",
+                &fields(&[("InstanceID", "0"), ("Channel", "Master")]),
+            )
+            .unwrap();
+        assert_eq!(r["CurrentMute"], "0");
+
+        // ConnectionManager GetProtocolInfo advertises only natively decoded formats.
+        let info = tr.call(CM, "GetProtocolInfo", &Fields::new()).unwrap();
+        let sink = &info["Sink"];
+        assert!(sink.contains("audio/flac"));
+        assert!(sink.contains("audio/wav"));
+        assert!(!sink.contains("audio/opus"));
+        assert!(!sink.contains("audio/L16"));
+        assert!(!sink.contains("audio/dsf"));
+    }
+
+    #[test]
+    fn transport_rejects_invalid_instance_action_and_loop_mode() {
+        use crate::renderer::schema::AV;
+        let mut tr = test_transport(false);
+        assert_eq!(
+            tr.call(AV, "GetTransportInfo", &fields(&[("InstanceID", "1")]))
+                .unwrap_err()
+                .code,
+            Fault::INVALID_INSTANCE.code
+        );
+        assert_eq!(
+            tr.call(AV, "NoSuchAction", &fields(&[("InstanceID", "0")]))
+                .unwrap_err()
+                .code,
+            Fault::INVALID_ACTION.code
+        );
+        assert_eq!(
+            tr.call(PQ, "SetQueueLoopMode", &fields(&[("LoopMode", "99")]))
+                .unwrap_err()
+                .code,
+            Fault::INVALID_ARGS.code
+        );
+    }
+
+    #[test]
+    fn transport_queue_lifecycle_and_delete() {
+        let mut tr = test_transport(false);
+        let ctx = r#"<PlayList><ListName>Album</ListName><ListInfo><TrackNumber>2</TrackNumber></ListInfo><Tracks><Track1><URL>http://127.0.0.1:9/a.flac</URL><Metadata>&lt;DIDL/&gt;</Metadata></Track1><Track2><URL>http://127.0.0.1:9/b.flac</URL><Metadata>&lt;DIDL/&gt;</Metadata></Track2></Tracks></PlayList>"#;
+        tr.call(PQ, "CreateQueue", &fields(&[("QueueContext", ctx)]))
+            .unwrap();
+        let qi = tr
+            .call(PQ, "GetQueueIndex", &fields(&[("QueueName", "Album")]))
+            .unwrap();
+        assert_eq!(qi["CurrentIndex"], "1");
+        assert_eq!(qi["TrackNums"], "2");
+
+        tr.call(PQ, "SetQueueLoopMode", &fields(&[("LoopMode", "0")]))
+            .unwrap();
+        let ts = tr
+            .call(
+                crate::renderer::schema::AV,
+                "GetTransportSettings",
+                &fields(&[("InstanceID", "0")]),
+            )
+            .unwrap();
+        assert_eq!(ts["PlayMode"], "REPEAT_ALL");
+
+        tr.call(
+            PQ,
+            "RemoveTracksInQueue",
+            &fields(&[
+                ("QueueName", "Album"),
+                ("RangStart", "1"),
+                ("RangEnd", "2"),
+                ("Action", "0"),
+            ]),
+        )
+        .unwrap();
+        assert!(tr.q.items.is_empty());
+        assert_eq!(tr.state, "NO_MEDIA_PRESENT");
+    }
 }

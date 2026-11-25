@@ -309,4 +309,63 @@ mod tests {
         );
         assert_eq!(out, [0u8; 6]);
     }
+
+    #[test]
+    fn pack_s24_in_32_left_and_right_are_bit_exact() {
+        let raw24: [i32; 2] = [0x0012_3456, -0x0000_0001];
+        let q31: Vec<i32> = raw24.iter().map(|&v| v << 8).collect();
+
+        let mut left = [0u8; 8];
+        pack_interleaved(&q31, &mut left, SampleFormat::S24In32Left, 1 << 16);
+        assert_eq!(
+            i32::from_le_bytes(left[0..4].try_into().unwrap()),
+            0x1234_5600
+        );
+        assert_eq!(
+            i32::from_le_bytes(left[4..8].try_into().unwrap()),
+            -256 // 0xFFFF_FF00
+        );
+
+        let mut right = [0u8; 8];
+        pack_interleaved(&q31, &mut right, SampleFormat::S24In32Right, 1 << 16);
+        assert_eq!(
+            i32::from_le_bytes(right[0..4].try_into().unwrap()),
+            0x0012_3456
+        );
+        assert_eq!(i32::from_le_bytes(right[4..8].try_into().unwrap()), -1);
+    }
+
+    #[test]
+    fn pack_planar_channel_separates_left_and_right() {
+        // 2 frames of stereo: (L0, R0), (L1, R1)
+        let stereo = [0x1111_0000i32, 0x2222_0000, 0x3333_0000, 0x4444_0000];
+        let mut ch0 = [0u8; 4];
+        let mut ch1 = [0u8; 4];
+        assert_eq!(
+            pack_planar_channel(&stereo, 2, 0, &mut ch0, SampleFormat::S16, 1 << 16),
+            4
+        );
+        assert_eq!(
+            pack_planar_channel(&stereo, 2, 1, &mut ch1, SampleFormat::S16, 1 << 16),
+            4
+        );
+        assert_eq!(i16::from_le_bytes(ch0[0..2].try_into().unwrap()), 0x1111);
+        assert_eq!(i16::from_le_bytes(ch0[2..4].try_into().unwrap()), 0x3333);
+        assert_eq!(i16::from_le_bytes(ch1[0..2].try_into().unwrap()), 0x2222);
+        assert_eq!(i16::from_le_bytes(ch1[2..4].try_into().unwrap()), 0x4444);
+    }
+
+    #[test]
+    fn volume_gain_q16_is_monotonic_and_clamped() {
+        assert_eq!(volume_gain_q16(0, false), 0);
+        assert_eq!(volume_gain_q16(100, false), 1 << 16);
+        assert_eq!(volume_gain_q16(255, false), 1 << 16);
+        assert_eq!(volume_gain_q16(100, true), 0);
+        let mut prev = 0;
+        for v in 1..=100 {
+            let g = volume_gain_q16(v, false);
+            assert!(g >= prev, "volume {v} gain {g} < prev {prev}");
+            prev = g;
+        }
+    }
 }

@@ -1119,4 +1119,126 @@ mod tests {
         st.muted = false;
         assert_eq!(apply_output_gain(&mut st), 1 << 16);
     }
+
+    #[test]
+    fn cross_sample_rate_transition_reconfigures_stream() {
+        let dir = std::env::temp_dir().join(format!("tacet-audio-xrate-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let wav1 = dir.join("t44.wav");
+        let wav2 = dir.join("t48.wav");
+        write_test_wav(&wav1, 44_100, 4_410, 440.0); // 100 ms @ 44.1 kHz
+        write_test_wav(&wav2, 48_000, 4_800, 880.0); // 100 ms @ 48 kHz
+
+        let (player, rx) = Player::new(EngineConfig {
+            audio_device: "null".into(),
+            exclusive: false,
+            initial_volume: 100,
+        })
+        .unwrap();
+
+        let sid = player.open(wav1.to_str().unwrap(), true).unwrap();
+        let ev = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            matches!(ev, PlaybackEvent::Ready { session_id, spec, .. } if session_id == sid && spec.sample_rate == 44_100)
+        );
+
+        player.queue_next(wav2.to_str().unwrap());
+        player.play();
+
+        let mut saw_48k = false;
+        let mut saw_ended = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !saw_ended {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+                match ev {
+                    PlaybackEvent::TrackChanged {
+                        session_id, spec, ..
+                    } => {
+                        assert_eq!(session_id, sid);
+                        assert_eq!(spec.sample_rate, 48_000);
+                        saw_48k = true;
+                    }
+                    PlaybackEvent::TrackEnded { session_id } => {
+                        assert_eq!(session_id, sid);
+                        saw_ended = true;
+                    }
+                    PlaybackEvent::Error { message, .. } => panic!("unexpected error: {message}"),
+                    _ => {}
+                }
+            }
+        }
+        player.close();
+        assert!(saw_48k, "expected TrackChanged at 48 kHz");
+        assert!(saw_ended, "expected TrackEnded");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seek_pause_and_error_emit_expected_lifecycle_events() {
+        let dir = std::env::temp_dir().join(format!("tacet-audio-seek-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let wav = dir.join("long.wav");
+        write_test_wav(&wav, 44_100, 22_050, 440.0); // 500 ms
+
+        let (player, rx) = Player::new(EngineConfig {
+            audio_device: "null".into(),
+            exclusive: false,
+            initial_volume: 100,
+        })
+        .unwrap();
+
+        let sid1 = player.open(wav.to_str().unwrap(), true).unwrap();
+        let ev = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(ev, PlaybackEvent::Ready { session_id, .. } if session_id == sid1));
+
+        // While paused, position stays at 0.
+        thread::sleep(Duration::from_millis(40));
+        assert!(player.position().position_secs < 0.05);
+
+        // Seek near the end (0.35s) and unpause -> completes quickly.
+        player.seek(0.35).unwrap();
+        player.play();
+
+        let mut saw_ended = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < deadline && !saw_ended {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(50))
+                && matches!(ev, PlaybackEvent::TrackEnded { session_id } if session_id == sid1)
+            {
+                saw_ended = true;
+            }
+        }
+        assert!(saw_ended, "expected TrackEnded after seek");
+
+        // Opening a missing file emits Error with a strictly newer session_id.
+        let sid2 = player
+            .open("/nonexistent/tacet-missing-file.flac", false)
+            .unwrap();
+        assert!(sid2 > sid1);
+        let ev = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(ev, PlaybackEvent::Error { session_id, .. } if session_id == sid2));
+
+        player.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_generation_counter_handles_back_to_back_flushes() {
+        let (mut prod, mut cons) = RingBuffer::<i32>::new(64);
+        let shared = StreamShared::new(false, 1 << 16);
+
+        // Push 4 samples, request flush #1, sink flushes it.
+        assert_eq!(push_samples(&mut prod, &[1, 2, 3, 4], 2), 4);
+        let g1 = shared.flush_req.fetch_add(1, Ordering::Release) + 1;
+        shared.maybe_flush(&mut cons);
+        assert_eq!(shared.flush_ack.load(Ordering::Acquire), g1);
+        assert_eq!(cons.slots(), 0);
+
+        // Request flush #2, push stale samples before sink sees #2 -> sink drains them.
+        let g2 = shared.flush_req.fetch_add(1, Ordering::Release) + 1;
+        assert_eq!(push_samples(&mut prod, &[9, 9], 2), 2);
+        shared.maybe_flush(&mut cons);
+        assert_eq!(shared.flush_ack.load(Ordering::Acquire), g2);
+        assert_eq!(cons.slots(), 0);
+    }
 }
