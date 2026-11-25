@@ -16,9 +16,9 @@ http-body-util = "0.1"
 bytes = "1"
 socket2 = { version = "0.6", features = ["all"] }
 if-addrs = "0.15"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 quick-xml = "0.37"
 uuid = { version = "1", features = ["v4", "v5"] }
 rand = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

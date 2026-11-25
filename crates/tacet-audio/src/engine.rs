@@ -893,14 +893,41 @@ fn run_worker(
                     thread::sleep(Duration::from_millis(5));
                 }
 
+                // Drain any last-instant QueueNext that arrived while the sink
+                // finished draining (e.g. unpaced PCM sink or very short tracks).
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    if let WorkerCmd::QueueNext(next) = cmd {
+                        queued_next = next;
+                    }
+                }
+
                 if !cancel.load(Ordering::Relaxed)
                     && !shared.is_failed()
                     && let Some(next_url) = queued_next.take()
                 {
-                    // A cross-rate successor arrived while draining: reconfigure hardware now.
+                    // A successor arrived while draining: if same format and
+                    // stream is still open (just finished draining), continue
+                    // gaplessly on the same stream; otherwise reconfigure hardware.
                     match AudioDecoder::open(&next_url, Arc::clone(&cancel)) {
                         Ok(next_dec) => {
                             let next_info = next_dec.info().clone();
+                            if next_info.spec.hardware_compatible(cur_spec) {
+                                shared.draining.store(false, Ordering::Release);
+                                shared.finished.store(false, Ordering::Release);
+                                let boundary = frames_pushed;
+                                let active = stream.active_output().clone();
+                                {
+                                    let mut t = timing.lock().unwrap();
+                                    t.pending_transitions.push_back(PendingTransition {
+                                        boundary_frame: boundary,
+                                        url: next_url,
+                                        info: next_info,
+                                        active,
+                                    });
+                                }
+                                decoder = next_dec;
+                                continue 'outer;
+                            }
                             drop(stream);
                             shared.stop.store(false, Ordering::Release);
                             shared.draining.store(false, Ordering::Release);
