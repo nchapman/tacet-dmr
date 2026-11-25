@@ -1,23 +1,34 @@
-//! Streaming audio decoder backed by `symphonia`.
+//! Streaming audio decoder backed by `symphonia` + `symphonia-opus`.
 //!
-//! Decodes FLAC, ALAC, WAV, AIFF, CAF, MP3, AAC, Vorbis, Ogg, MP4/M4A, and
-//! MKV/WebM into interleaved Q31 `i32` samples with gapless trimming enabled.
+//! Decodes FLAC, ALAC, WAV, AIFF, CAF, MP3, AAC, Vorbis, Opus, Ogg, MP4/M4A,
+//! and MKV/WebM into interleaved Q31 `i32` samples with gapless trimming enabled.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder, DecoderOptions};
+use symphonia::core::codecs::audio::{AudioDecoder as SymphoniaAudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::registry::CodecRegistry;
+use symphonia::core::common::Tier;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 use crate::format::PcmSpec;
 use crate::source;
+
+fn codec_registry() -> &'static CodecRegistry {
+    static REGISTRY: OnceLock<CodecRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut reg = CodecRegistry::new();
+        symphonia::default::register_enabled_codecs(&mut reg);
+        reg.register_audio_decoder_at_tier::<symphonia_opus::OpusDecoder>(Tier::Fallback);
+        reg
+    })
+}
 
 /// Metadata discovered when opening a track.
 #[derive(Debug, Clone)]
@@ -30,10 +41,10 @@ pub struct TrackInfo {
 /// Streaming decoder yielding chunks of interleaved Q31 `i32` PCM samples.
 pub struct AudioDecoder {
     format: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
+    decoder: Box<dyn SymphoniaAudioDecoder>,
     track_id: u32,
     info: TrackInfo,
-    sample_buf: Option<SampleBuffer<i32>>,
+    sample_buf: Vec<i32>,
     time_base_secs: f64,
 }
 
@@ -50,31 +61,29 @@ impl AudioDecoder {
         }
 
         let mss = MediaSourceStream::new(opened.source, Default::default());
-        let format_opts = FormatOptions {
-            enable_gapless: true,
-            ..Default::default()
-        };
-        let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &format_opts, &MetadataOptions::default())
+        let format = symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
             .map_err(|e| format!("probe audio format: {e}"))?;
 
-        let format = probed.format;
         let track = format
-            .default_track()
-            .filter(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            .or_else(|| {
-                format
-                    .tracks()
-                    .iter()
-                    .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            })
+            .default_track(TrackType::Audio)
             .ok_or_else(|| "no supported audio track found".to_string())?;
 
         let track_id = track.id;
-        let params = track.codec_params.clone();
+        let params = track
+            .codec_params
+            .as_ref()
+            .and_then(|p| p.audio())
+            .ok_or_else(|| "audio track missing codec parameters".to_string())?
+            .clone();
 
-        let decoder = symphonia::default::get_codecs()
-            .make(&params, &DecoderOptions::default())
+        let decoder = codec_registry()
+            .make_audio_decoder(&params, &AudioDecoderOptions::default())
             .map_err(|e| format!("create audio decoder: {e}"))?;
 
         let sample_rate = params
@@ -82,6 +91,7 @@ impl AudioDecoder {
             .ok_or_else(|| "audio track missing sample rate".to_string())?;
         let channels = params
             .channels
+            .as_ref()
             .map(|c| c.count() as u16)
             .unwrap_or(2)
             .max(1);
@@ -90,21 +100,20 @@ impl AudioDecoder {
             .or(params.bits_per_coded_sample)
             .unwrap_or(24) as u16;
 
-        let duration_secs = params.n_frames.and_then(|frames| {
-            if let Some(tb) = params.time_base {
-                let t = tb.calc_time(frames);
-                Some(t.seconds as f64 + t.frac)
+        let time_base_secs = track
+            .time_base
+            .map(|tb| tb.numer.get() as f64 / tb.denom.get() as f64)
+            .unwrap_or_else(|| 1.0 / sample_rate as f64);
+
+        let duration_secs = track.num_frames.and_then(|frames| {
+            if track.time_base.is_some() {
+                Some(frames as f64 * time_base_secs)
             } else if sample_rate > 0 {
                 Some(frames as f64 / sample_rate as f64)
             } else {
                 None
             }
         });
-
-        let time_base_secs = params
-            .time_base
-            .map(|tb| tb.numer as f64 / tb.denom as f64)
-            .unwrap_or_else(|| 1.0 / sample_rate as f64);
 
         let codec = format!("{:?}", params.codec);
 
@@ -117,7 +126,7 @@ impl AudioDecoder {
                 duration_secs,
                 codec,
             },
-            sample_buf: None,
+            sample_buf: Vec::new(),
             time_base_secs,
         })
     }
@@ -132,7 +141,8 @@ impl AudioDecoder {
     pub fn next_chunk(&mut self) -> Result<Option<&[i32]>, String> {
         loop {
             let packet = match self.format.next_packet() {
-                Ok(p) => p,
+                Ok(Some(p)) => p,
+                Ok(None) => return Ok(None),
                 Err(SymphoniaError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     return Ok(None);
                 }
@@ -143,7 +153,7 @@ impl AudioDecoder {
                 Err(e) => return Err(format!("read packet: {e}")),
             };
 
-            if packet.track_id() != self.track_id {
+            if packet.track_id != self.track_id {
                 continue;
             }
 
@@ -152,18 +162,9 @@ impl AudioDecoder {
                     if decoded.frames() == 0 {
                         continue;
                     }
-                    let spec = *decoded.spec();
-                    let capacity = decoded.capacity() as u64;
-                    let needs_alloc = self
-                        .sample_buf
-                        .as_ref()
-                        .is_none_or(|b| b.capacity() < decoded.frames() * spec.channels.count());
-                    if needs_alloc {
-                        self.sample_buf = Some(SampleBuffer::<i32>::new(capacity, spec));
-                    }
-                    let buf = self.sample_buf.as_mut().unwrap();
-                    buf.copy_interleaved_ref(decoded);
-                    return Ok(Some(buf.samples()));
+                    self.sample_buf.clear();
+                    decoded.copy_to_vec_interleaved(&mut self.sample_buf);
+                    return Ok(Some(&self.sample_buf));
                 }
                 Err(SymphoniaError::DecodeError(_)) => {
                     // Recoverable frame error; keep streaming.
@@ -181,19 +182,19 @@ impl AudioDecoder {
     /// timestamp in seconds.
     pub fn seek(&mut self, seconds: f64) -> Result<f64, String> {
         let clamped = seconds.max(0.0);
-        let whole = clamped.floor() as u64;
-        let frac = clamped - whole as f64;
+        let time = Time::try_from_secs_f64(clamped)
+            .ok_or_else(|| format!("invalid seek time {clamped}"))?;
         let seeked = self
             .format
             .seek(
                 SeekMode::Accurate,
                 SeekTo::Time {
-                    time: Time::new(whole, frac),
+                    time,
                     track_id: Some(self.track_id),
                 },
             )
             .map_err(|e| format!("seek to {clamped:.2}s: {e}"))?;
         self.decoder.reset();
-        Ok(seeked.actual_ts as f64 * self.time_base_secs)
+        Ok(seeked.actual_ts.get() as f64 * self.time_base_secs)
     }
 }

@@ -11,9 +11,9 @@ pub const PQ: &str = "PlayQueue";
 pub const SERVICES: &[&str] = &[AV, RC, CM, PQ];
 
 /// Containerized audio MIME types natively demuxed and decoded by `tacet-audio`
-/// (`symphonia` pure-Rust decoders). Unimplemented codecs (Opus, DSF, WavPack,
-/// APE, WMA, raw audio/L16) are intentionally omitted so control points like
-/// Tacet transcode them automatically rather than failing playback.
+/// (`symphonia` + `symphonia-opus` pure-Rust decoders). Unimplemented codecs
+/// (DSF, WavPack, APE, WMA, raw audio/L16) are intentionally omitted so control
+/// points like Tacet transcode them automatically rather than failing playback.
 pub const SINK_MIMES: &[&str] = &[
     "audio/flac",
     "audio/x-flac",
@@ -27,6 +27,7 @@ pub const SINK_MIMES: &[&str] = &[
     "audio/x-m4a",
     "audio/alac",
     "audio/ogg",
+    "audio/opus",
     "application/ogg",
     "audio/webm",
     "audio/x-matroska",

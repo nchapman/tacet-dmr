@@ -864,7 +864,7 @@ mod tests {
         let sink = &info["Sink"];
         assert!(sink.contains("audio/flac"));
         assert!(sink.contains("audio/wav"));
-        assert!(!sink.contains("audio/opus"));
+        assert!(sink.contains("audio/opus"));
         assert!(!sink.contains("audio/L16"));
         assert!(!sink.contains("audio/dsf"));
     }
