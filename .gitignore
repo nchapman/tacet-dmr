@@ -1,6 +1,7 @@
 .pi/
 .DS_Store
 /dist/
+/target/
 /tacet-dmr
 /tacet-dmr.exe
 __pycache__/
