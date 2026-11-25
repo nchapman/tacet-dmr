@@ -233,11 +233,28 @@ pub fn spawn_notifier(
     on_drop: impl FnOnce(String) + Send + 'static,
 ) {
     tokio::spawn(async move {
-        // Yield briefly so the HTTP SUBSCRIBE 200 OK response flushes first.
-        tokio::task::yield_now().await;
+        // Brief pause so the HTTP SUBSCRIBE 200 OK response (carrying SID)
+        // flushes to the controller before SEQ=0 NOTIFY arrives.
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
         let mut seq: u32 = 0;
 
-        if !send_notify(&callback, &sid, &service, seq, &initial).await {
+        let delivered = tokio::select! {
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    return;
+                }
+                true
+            }
+            ok = send_notify(&callback, &sid, &service, seq, &initial) => ok,
+        };
+        if !delivered {
             on_drop(sid);
             return;
         }
@@ -255,7 +272,16 @@ pub fn spawn_notifier(
                         break;
                     }
                     let snap = rx.borrow_and_update().clone();
-                    if !send_notify(&callback, &sid, &service, seq, &snap).await {
+                    let ok = tokio::select! {
+                        _ = stop_rx.changed() => {
+                            if *stop_rx.borrow() {
+                                break;
+                            }
+                            true
+                        }
+                        ok = send_notify(&callback, &sid, &service, seq, &snap) => ok,
+                    };
+                    if !ok {
                         on_drop(sid);
                         return;
                     }

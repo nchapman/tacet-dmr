@@ -19,6 +19,7 @@ pub type Fields = HashMap<String, String>;
 pub struct Transport {
     player: Player,
     events: Receiver<PlaybackEvent>,
+    active_session_id: u64,
     pub q: Playlist,
     pub state: String,
     pub status: String,
@@ -47,6 +48,7 @@ impl Transport {
         Ok(Self {
             player,
             events,
+            active_session_id: 0,
             q: Playlist::default(),
             state: "NO_MEDIA_PRESENT".into(),
             status: "OK".into(),
@@ -114,6 +116,10 @@ impl Transport {
     pub fn poll_events(&mut self) -> bool {
         let mut changed = false;
         while let Ok(ev) = self.events.try_recv() {
+            // Ignore stale events left over from a cancelled/previous session.
+            if self.active_session_id == 0 || ev.session_id() != self.active_session_id {
+                continue;
+            }
             changed = true;
             match ev {
                 PlaybackEvent::Ready {
@@ -138,12 +144,18 @@ impl Transport {
                     self.sync_gapless_next();
                 }
                 PlaybackEvent::TrackChanged {
+                    url,
                     duration_secs,
                     active,
                     ..
                 } => {
                     // Advance queue cursor to the track that just started playing gaplessly.
-                    if let Some(next_idx) = self.q.step(1, true) {
+                    // Verify `url` matches the expected next track in case the queue was
+                    // mutated during the ~1.5s pre-buffer window.
+                    let expected_next = self.q.step(1, true);
+                    if let Some(next_idx) = expected_next
+                        && self.q.items.get(next_idx).is_some_and(|t| t.uri == url)
+                    {
                         self.q.index = next_idx;
                         if self.q.name.is_empty() && self.q.items.len() > 1 {
                             // Generic AVTransport SetNextAVTransportURI: promote next to current.
@@ -151,6 +163,12 @@ impl Transport {
                             self.q.items = vec![cur];
                             self.q.index = 0;
                         }
+                    } else if let Some(found_idx) = self.q.items.iter().position(|t| t.uri == url) {
+                        self.q.index = found_idx;
+                    } else if let Some(next_idx) = expected_next {
+                        // The pre-buffered track was removed mid-buffer; switch to the intended next track.
+                        let _ = self.select_track(next_idx, "PLAYING");
+                        continue;
                     }
                     self.pos_secs = 0.0;
                     self.duration_secs = duration_secs.unwrap_or(0.0);
@@ -162,26 +180,34 @@ impl Transport {
                     ));
                     self.sync_gapless_next();
                 }
-                PlaybackEvent::TrackEnded => {
+                PlaybackEvent::TrackEnded { .. } => {
                     // If a successor exists (e.g. queued late or repeat), start it;
                     // otherwise settle cleanly into STOPPED.
                     if let Some(next_idx) = self.q.step(1, true)
                         && self.state == "PLAYING"
                     {
-                        let _ = self.select_track(next_idx, "PLAYING");
+                        if self.q.name.is_empty() && self.q.items.len() > 1 {
+                            let cur = self.q.items[next_idx].clone();
+                            self.q.items = vec![cur];
+                            let _ = self.select_track(0, "PLAYING");
+                        } else {
+                            let _ = self.select_track(next_idx, "PLAYING");
+                        }
                     } else {
                         self.ended = true;
                         self.state = "STOPPED".into();
+                        self.active_session_id = 0;
                         self.pos_secs = 0.0;
                         self.active_open = false;
                         self.queued_next_uri = None;
                         self.player.stop();
                     }
                 }
-                PlaybackEvent::Error(e) => {
+                PlaybackEvent::Error { message: e, .. } => {
                     self.log(&format!("error: playback: {e}"));
                     self.status = "ERROR_OCCURRED".into();
                     self.state = "STOPPED".into();
+                    self.active_session_id = 0;
                     self.active_open = false;
                     self.ended = false;
                     self.queued_next_uri = None;
@@ -212,7 +238,9 @@ impl Transport {
     }
 
     fn release(&mut self) {
+        self.active_session_id = 0;
         self.player.stop();
+        while self.events.try_recv().is_ok() {}
         self.active_open = false;
         self.ended = false;
         self.queued_next_uri = None;
@@ -239,11 +267,12 @@ impl Transport {
         self.duration_secs = 0.0;
         self.ended = false;
         self.queued_next_uri = None;
-        self.player.open(&cur.uri, paused).map_err(|e| {
+        let sid = self.player.open(&cur.uri, paused).map_err(|e| {
             self.log(&format!("error: open track: {e}"));
             self.status = "ERROR_OCCURRED".into();
             Fault::ACTION_FAILED
         })?;
+        self.active_session_id = sid;
         self.active_open = true;
         self.status = "OK".into();
         self.state = if paused {
@@ -738,5 +767,19 @@ fn parse_time(raw: &str) -> Option<f64> {
     if !(0.0..60.0).contains(&s) || !s.is_finite() {
         return None;
     }
-    Some((h * 3600 + m * 60) as f64 + s)
+    let total_whole = h.checked_mul(3600)?.checked_add(m * 60)?;
+    Some(total_whole as f64 + s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_time_rejects_overflow_and_invalid_values() {
+        assert_eq!(parse_time("0:01:30.5"), Some(90.5));
+        assert_eq!(parse_time("9999999999999999999:00:00"), None);
+        assert_eq!(parse_time("0:60:00"), None);
+        assert_eq!(parse_time("0:00:NaN"), None);
+    }
 }

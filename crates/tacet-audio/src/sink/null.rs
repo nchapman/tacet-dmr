@@ -54,7 +54,9 @@ impl NullStream {
                     if avail_frames == 0 {
                         if shared_bg.is_draining() {
                             shared_bg.finished.store(true, Ordering::Release);
-                            break;
+                            thread::sleep(Duration::from_millis(5));
+                            next_tick = Instant::now();
+                            continue;
                         }
                         thread::sleep(Duration::from_millis(2));
                         next_tick = Instant::now();
@@ -157,7 +159,8 @@ impl PcmFileStream {
                         if shared_bg.is_draining() {
                             let _ = writer.flush();
                             shared_bg.finished.store(true, Ordering::Release);
-                            break;
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
                         }
                         thread::sleep(Duration::from_millis(2));
                         continue;

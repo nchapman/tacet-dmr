@@ -160,7 +160,25 @@ async fn main() -> ExitCode {
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm = signal(SignalKind::terminate()).ok();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = async {
+                        if let Some(ref mut s) = sigterm {
+                            s.recv().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
             let _ = shutdown_tx.send(true);
         });
         let mut stdout = io::stdout();
@@ -220,8 +238,8 @@ async fn main() -> ExitCode {
                         active.exclusive
                     );
                 }
-                PlaybackEvent::TrackEnded => break,
-                PlaybackEvent::Error(e) => {
+                PlaybackEvent::TrackEnded { .. } => break,
+                PlaybackEvent::Error { message: e, .. } => {
                     eprintln!("tacet-dmr: {e}");
                     return ExitCode::from(1);
                 }

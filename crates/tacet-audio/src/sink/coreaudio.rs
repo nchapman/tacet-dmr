@@ -257,7 +257,6 @@ pub(crate) fn asbd_to_sample_format(
     let non_interleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
     let is_float = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
     let is_signed = (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0;
-    let is_packed = (asbd.mFormatFlags & kAudioFormatFlagIsPacked) != 0;
     let is_high = (asbd.mFormatFlags & kAudioFormatFlagIsAlignedHigh) != 0;
 
     let ch = asbd.mChannelsPerFrame.max(1);
@@ -275,7 +274,7 @@ pub(crate) fn asbd_to_sample_format(
         // 3-byte tightly packed 24-bit integer (e.g. AudioQuest DragonFly Black!).
         SampleFormat::S24Packed
     } else if is_signed && asbd.mBitsPerChannel == 24 && bytes_per_sample == 4 {
-        if is_high || (!is_packed && is_high) {
+        if is_high {
             SampleFormat::S24In32Left
         } else {
             SampleFormat::S24In32Right
@@ -316,31 +315,24 @@ pub(crate) fn select_best_physical_format(
         }
 
         // Choose concrete sample rate within ranged description.
+        // Require an exact sample-rate match in exclusive mode: tacet-audio
+        // does not software-resample, so silently clocking PCM at the wrong
+        // rate would play at the wrong speed/pitch.
         let min_r = ranged.mSampleRateRange.mMinimum;
         let max_r = ranged.mSampleRateRange.mMaximum;
-        let chosen_rate = if target_rate >= min_r && target_rate <= max_r {
-            target_rate
-        } else if target_rate < min_r {
-            min_r
-        } else {
-            max_r
-        };
-        if chosen_rate <= 0.0 {
+        if target_rate < min_r - 1.0 || target_rate > max_r + 1.0 || target_rate <= 0.0 {
+            continue;
+        }
+        let chosen_rate = target_rate.clamp(min_r, max_r);
+        if (chosen_rate - target_rate).abs() >= 1.0 {
             continue;
         }
         asbd.mSampleRate = chosen_rate;
 
-        let rate_exact = (chosen_rate - target_rate).abs() < 1.0;
-        let rate_diff = (chosen_rate - target_rate).abs() as i64;
         let ch_exact = asbd.mChannelsPerFrame == spec.channels as u32;
 
         // Higher score wins.
-        let mut score: i64 = 0;
-        if rate_exact {
-            score += 10_000_000;
-        } else {
-            score -= rate_diff.min(5_000_000);
-        }
+        let mut score: i64 = 10_000_000;
         if ch_exact {
             score += 1_000_000;
         } else {
@@ -399,6 +391,7 @@ struct HalIoContext {
     src_channels: usize,
     dst_channels: usize,
     non_interleaved: bool,
+    drain_silence_callbacks: u8,
     scratch: Vec<i32>,
 }
 
@@ -458,23 +451,30 @@ unsafe extern "C" fn hal_io_proc(
     if avail_frames == 0 {
         zero_all(buffers);
         if ctx.shared.is_draining() {
-            ctx.shared.finished.store(true, Ordering::Release);
+            // Wait one full silence callback after the final audio buffer so
+            // hardware finishes clocking out the previous DMA buffer before stop.
+            ctx.drain_silence_callbacks = ctx.drain_silence_callbacks.saturating_add(1);
+            if ctx.drain_silence_callbacks >= 2 {
+                ctx.shared.finished.store(true, Ordering::Release);
+            }
         } else {
+            ctx.drain_silence_callbacks = 0;
             ctx.shared.underruns.fetch_add(1, Ordering::Relaxed);
         }
         return 0;
     }
+    ctx.drain_silence_callbacks = 0;
 
     let take_frames = avail_frames.min(frames);
     let need_scratch = frames * dst_ch;
     if ctx.scratch.len() < need_scratch {
         // Scratch is pre-sized generously on open; if CoreAudio ever asks for a
-        // larger burst, clamp to scratch capacity rather than allocating in RT.
+        // larger burst, output silence rather than allocating in RT.
         zero_all(buffers);
         return 0;
     }
 
-    // Read interleaved source frames into scratch (upmixing/padding to dst_ch if needed).
+    // Read interleaved source frames into scratch (upmixing mono->stereo or padding to dst_ch).
     let dst_slice = &mut ctx.scratch[..frames * dst_ch];
     dst_slice.fill(0);
     if let Ok(chunk) = ctx.consumer.read_chunk(take_frames * src_ch) {
@@ -483,6 +483,13 @@ unsafe extern "C" fn hal_io_proc(
             let n1 = s1.len();
             dst_slice[..n1].copy_from_slice(s1);
             dst_slice[n1..n1 + s2.len()].copy_from_slice(s2);
+        } else if src_ch == 1 && dst_ch >= 2 {
+            let mut src_iter = s1.iter().chain(s2.iter());
+            for f in 0..take_frames {
+                let v = *src_iter.next().unwrap_or(&0);
+                dst_slice[f * dst_ch] = v;
+                dst_slice[f * dst_ch + 1] = v;
+            }
         } else {
             let mut src_iter = s1.iter().chain(s2.iter());
             for f in 0..take_frames {
@@ -499,35 +506,48 @@ unsafe extern "C" fn hal_io_proc(
 
     let gain = ctx.shared.gain_q16();
     if ctx.non_interleaved {
+        let need_bytes = frames * bps;
         for (ch_idx, b) in buffers.iter_mut().enumerate() {
             if b.mData.is_null() || b.mDataByteSize == 0 {
                 continue;
             }
             let out =
                 unsafe { slice::from_raw_parts_mut(b.mData as *mut u8, b.mDataByteSize as usize) };
-            if ch_idx < dst_ch {
+            if ch_idx < dst_ch && out.len() >= need_bytes {
                 pack_planar_channel(dst_slice, dst_ch, ch_idx, out, ctx.format, gain);
             } else {
                 out.fill(0);
             }
         }
-    } else if !buffers[0].mData.is_null() {
-        let out = unsafe {
-            slice::from_raw_parts_mut(
-                buffers[0].mData as *mut u8,
-                buffers[0].mDataByteSize as usize,
-            )
-        };
-        pack_interleaved(dst_slice, out, ctx.format, gain);
+    } else {
+        // Zero any secondary stream buffers first.
+        for b in buffers.iter_mut().skip(1) {
+            if !b.mData.is_null() && b.mDataByteSize > 0 {
+                let extra = unsafe {
+                    slice::from_raw_parts_mut(b.mData as *mut u8, b.mDataByteSize as usize)
+                };
+                extra.fill(0);
+            }
+        }
+        let need_bytes = dst_slice.len() * bps;
+        if !buffers[0].mData.is_null() {
+            let out = unsafe {
+                slice::from_raw_parts_mut(
+                    buffers[0].mData as *mut u8,
+                    buffers[0].mDataByteSize as usize,
+                )
+            };
+            if buffers[0].mNumberChannels as usize == dst_ch && out.len() >= need_bytes {
+                pack_interleaved(dst_slice, out, ctx.format, gain);
+            } else {
+                out.fill(0);
+            }
+        }
     }
 
     ctx.shared
         .frames_played
         .fetch_add(take_frames as u64, Ordering::Relaxed);
-
-    if take_frames < frames && ctx.shared.is_draining() {
-        ctx.shared.finished.store(true, Ordering::Release);
-    }
 
     0
 }
@@ -555,7 +575,8 @@ impl CoreAudioHalStream {
         shared: Arc<StreamShared>,
     ) -> Result<Self, String> {
         // 1. Acquire hog mode for our PID so no other process can touch the DAC.
-        let mut hog_pid: i32 = std::process::id() as i32;
+        let my_pid: i32 = std::process::id() as i32;
+        let mut hog_pid: i32 = my_pid;
         let hog_addr = prop_addr(
             kAudioDevicePropertyHogMode,
             kAudioObjectPropertyScopeOutput,
@@ -571,15 +592,46 @@ impl CoreAudioHalStream {
                 (&mut hog_pid as *mut i32).cast::<c_void>(),
             )
         };
-        let hog_acquired = hog_status == 0;
+        // Verify ownership by reading back the hog PID.
+        let mut verify_pid: i32 = -1;
+        let mut verify_sz = size_of::<i32>() as u32;
+        let verify_status = unsafe {
+            AudioObjectGetPropertyData(
+                dev_id,
+                &hog_addr,
+                0,
+                null(),
+                &mut verify_sz,
+                (&mut verify_pid as *mut i32).cast::<c_void>(),
+            )
+        };
+        let hog_acquired = hog_status == 0 && (verify_status != 0 || verify_pid == my_pid);
         if !hog_acquired {
             return Err(format!(
-                "CoreAudio hog mode failed on {dev_name:?} (OSStatus {hog_status})"
+                "CoreAudio hog mode failed on {dev_name:?} (OSStatus {hog_status}, owner pid {verify_pid})"
             ));
         }
 
-        // Helper closure to release hog mode if any subsequent step fails.
-        let release_hog = || {
+        // Helper closure to restore physical format + release hog mode on any error.
+        let cleanup_hal = |sid: Option<AudioStreamID>,
+                           orig: Option<AudioStreamBasicDescription>| {
+            if let (Some(sid), Some(orig)) = (sid, orig) {
+                let phys_addr = prop_addr(
+                    kAudioStreamPropertyPhysicalFormat,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain,
+                );
+                let _ = unsafe {
+                    AudioObjectSetPropertyData(
+                        sid,
+                        &phys_addr,
+                        0,
+                        null(),
+                        size_of::<AudioStreamBasicDescription>() as u32,
+                        (&orig as *const AudioStreamBasicDescription).cast::<c_void>(),
+                    )
+                };
+            }
             let mut free_pid: i32 = -1;
             let _ = unsafe {
                 AudioObjectSetPropertyData(
@@ -655,14 +707,16 @@ impl CoreAudioHalStream {
                 }
             }
 
-            let Some((target_asbd, fmt, ni)) = select_best_physical_format(&available, spec) else {
-                release_hog();
+            let Some((target_asbd, _fmt, _ni)) = select_best_physical_format(&available, spec)
+            else {
+                cleanup_hal(None, None);
                 return Err(format!(
-                    "no compatible CoreAudio physical PCM format on {dev_name:?}"
+                    "no compatible CoreAudio physical PCM format on {dev_name:?} for {} Hz / {} ch",
+                    spec.sample_rate, spec.channels
                 ));
             };
 
-            // Apply physical format if different from current.
+            // Apply physical format.
             let set_status = unsafe {
                 AudioObjectSetPropertyData(
                     sid,
@@ -674,7 +728,7 @@ impl CoreAudioHalStream {
                 )
             };
             if set_status != 0 {
-                // Also try setting nominal sample rate on the device itself.
+                // Fallback: try setting nominal sample rate on the device itself.
                 let rate_addr = prop_addr(
                     kAudioDevicePropertyNominalSampleRate,
                     kAudioObjectPropertyScopeGlobal,
@@ -702,6 +756,7 @@ impl CoreAudioHalStream {
             );
             let deadline = Instant::now() + Duration::from_millis(500);
             let mut active_asbd = target_asbd;
+            let mut settled = false;
             loop {
                 let mut cur: AudioStreamBasicDescription = unsafe { zeroed() };
                 let mut cur_sz = size_of::<AudioStreamBasicDescription>() as u32;
@@ -718,6 +773,7 @@ impl CoreAudioHalStream {
                 if ok {
                     active_asbd = cur;
                     if (cur.mSampleRate - target_asbd.mSampleRate).abs() < 1.0 {
+                        settled = true;
                         break;
                     }
                 }
@@ -726,16 +782,26 @@ impl CoreAudioHalStream {
                 }
                 thread::sleep(Duration::from_millis(10));
             }
+            if !settled {
+                cleanup_hal(Some(sid), original_phys);
+                return Err(format!(
+                    "CoreAudio device {dev_name:?} did not switch to {} Hz (active: {} Hz)",
+                    spec.sample_rate, active_asbd.mSampleRate
+                ));
+            }
 
             // In direct HAL IOProc, CoreAudio delivers buffers in the stream's
-            // *virtual* format (which after setting physical format matches the
-            // physical format on integer streams, or F32 if CoreAudio keeps a
-            // float virtual format). Use whichever format the stream actually
-            // exposes to IOProc so our byte packing always matches!
-            let (io_fmt, io_ni) = asbd_to_sample_format(&active_asbd).unwrap_or((fmt, ni));
+            // *virtual* format. Fail cleanly if unrecognized rather than risking
+            // a byte-size mismatch inside the real-time IOProc.
+            let Some((io_fmt, io_ni)) = asbd_to_sample_format(&active_asbd) else {
+                cleanup_hal(Some(sid), original_phys);
+                return Err(format!(
+                    "unsupported CoreAudio active virtual PCM format on {dev_name:?}"
+                ));
+            };
             (active_asbd, io_fmt, io_ni)
         } else {
-            release_hog();
+            cleanup_hal(None, None);
             return Err(format!(
                 "CoreAudio device {dev_name:?} has no output streams"
             ));
@@ -750,6 +816,7 @@ impl CoreAudioHalStream {
             src_channels: spec.channels.max(1) as usize,
             dst_channels,
             non_interleaved,
+            drain_silence_callbacks: 0,
             scratch: vec![0i32; 16_384 * dst_channels],
         }));
 
@@ -764,7 +831,7 @@ impl CoreAudioHalStream {
         };
         if create_status != 0 {
             unsafe { drop(Box::from_raw(ctx)) };
-            release_hog();
+            cleanup_hal(stream_id, original_phys);
             return Err(format!(
                 "AudioDeviceCreateIOProcID failed on {dev_name:?} (OSStatus {create_status})"
             ));
@@ -776,7 +843,7 @@ impl CoreAudioHalStream {
                 let _ = AudioDeviceDestroyIOProcID(dev_id, io_proc_id);
                 drop(Box::from_raw(ctx));
             }
-            release_hog();
+            cleanup_hal(stream_id, original_phys);
             return Err(format!(
                 "AudioDeviceStart failed on {dev_name:?} (OSStatus {start_status})"
             ));
@@ -861,6 +928,7 @@ struct AuhalContext {
     consumer: Consumer<i32>,
     shared: Arc<StreamShared>,
     channels: usize,
+    drain_silence_callbacks: u8,
     scratch: Vec<i32>,
 }
 
@@ -899,15 +967,21 @@ unsafe extern "C" fn auhal_render_cb(
     if avail_frames == 0 {
         out.fill(0);
         if ctx.shared.is_draining() {
-            ctx.shared.finished.store(true, Ordering::Release);
+            ctx.drain_silence_callbacks = ctx.drain_silence_callbacks.saturating_add(1);
+            if ctx.drain_silence_callbacks >= 2 {
+                ctx.shared.finished.store(true, Ordering::Release);
+            }
         } else {
+            ctx.drain_silence_callbacks = 0;
             ctx.shared.underruns.fetch_add(1, Ordering::Relaxed);
         }
         return 0;
     }
+    ctx.drain_silence_callbacks = 0;
 
     let need_samples = frames * ch;
-    if ctx.scratch.len() < need_samples {
+    let need_bytes = need_samples * 4;
+    if ctx.scratch.len() < need_samples || out.len() < need_bytes {
         out.fill(0);
         return 0;
     }
@@ -928,10 +1002,6 @@ unsafe extern "C" fn auhal_render_cb(
     ctx.shared
         .frames_played
         .fetch_add(take_frames as u64, Ordering::Relaxed);
-
-    if take_frames < frames && ctx.shared.is_draining() {
-        ctx.shared.finished.store(true, Ordering::Release);
-    }
 
     0
 }
@@ -1022,6 +1092,7 @@ impl CoreAudioAuhalStream {
             consumer,
             shared: Arc::clone(&shared),
             channels: ch as usize,
+            drain_silence_callbacks: 0,
             scratch: vec![0i32; 16_384 * ch as usize],
         }));
 
@@ -1111,7 +1182,7 @@ impl Drop for CoreAudioAuhalStream {
 struct VolCache {
     device_id: AudioDeviceID,
     vol_elements: Vec<u32>,
-    mute_element: Option<u32>,
+    mute_elements: Vec<u32>,
     probed: bool,
 }
 
@@ -1186,13 +1257,24 @@ impl CoreAudioVolume {
             return Err("CoreAudio device has no settable volume scalar".into());
         }
 
-        let mute_element = [kAudioObjectPropertyElementMain, 1, 2]
-            .into_iter()
-            .find(|&el| is_settable(dev, kAudioDevicePropertyMute, el));
+        let mut mute_elements = Vec::new();
+        if is_settable(
+            dev,
+            kAudioDevicePropertyMute,
+            kAudioObjectPropertyElementMain,
+        ) {
+            mute_elements.push(kAudioObjectPropertyElementMain);
+        } else {
+            for ch in [1u32, 2u32] {
+                if is_settable(dev, kAudioDevicePropertyMute, ch) {
+                    mute_elements.push(ch);
+                }
+            }
+        }
 
         cache.device_id = dev;
         cache.vol_elements = vol_elements;
-        cache.mute_element = mute_element;
+        cache.mute_elements = mute_elements;
         cache.probed = true;
         Ok(dev)
     }
@@ -1267,58 +1349,66 @@ impl HardwareVolume for CoreAudioVolume {
     fn get_mute(&self) -> Result<bool, String> {
         let mut cache = self.cache.lock().unwrap();
         let dev = self.resolve_and_cache(&mut cache)?;
-        let Some(el) = cache.mute_element else {
+        if cache.mute_elements.is_empty() {
             return Ok(false);
-        };
-        let addr = prop_addr(
-            kAudioDevicePropertyMute,
-            kAudioObjectPropertyScopeOutput,
-            el,
-        );
-        let mut val: u32 = 0;
-        let mut sz = size_of::<u32>() as u32;
-        let st = unsafe {
-            AudioObjectGetPropertyData(
-                dev,
-                &addr,
-                0,
-                null(),
-                &mut sz,
-                (&mut val as *mut u32).cast::<c_void>(),
-            )
-        };
-        if st != 0 {
-            *cache = VolCache::default();
-            return Err(format!("CoreAudio get mute failed (OSStatus {st})"));
         }
-        Ok(val != 0)
+        let mut all_muted = true;
+        for &el in &cache.mute_elements {
+            let addr = prop_addr(
+                kAudioDevicePropertyMute,
+                kAudioObjectPropertyScopeOutput,
+                el,
+            );
+            let mut val: u32 = 0;
+            let mut sz = size_of::<u32>() as u32;
+            let st = unsafe {
+                AudioObjectGetPropertyData(
+                    dev,
+                    &addr,
+                    0,
+                    null(),
+                    &mut sz,
+                    (&mut val as *mut u32).cast::<c_void>(),
+                )
+            };
+            if st != 0 {
+                *cache = VolCache::default();
+                return Err(format!("CoreAudio get mute failed (OSStatus {st})"));
+            }
+            if val == 0 {
+                all_muted = false;
+            }
+        }
+        Ok(all_muted)
     }
 
     fn set_mute(&self, muted: bool) -> Result<(), String> {
         let mut cache = self.cache.lock().unwrap();
         let dev = self.resolve_and_cache(&mut cache)?;
-        let Some(el) = cache.mute_element else {
+        if cache.mute_elements.is_empty() {
             return Err("CoreAudio device does not support hardware mute".into());
-        };
-        let addr = prop_addr(
-            kAudioDevicePropertyMute,
-            kAudioObjectPropertyScopeOutput,
-            el,
-        );
+        }
         let val: u32 = if muted { 1 } else { 0 };
-        let st = unsafe {
-            AudioObjectSetPropertyData(
-                dev,
-                &addr,
-                0,
-                null(),
-                size_of::<u32>() as u32,
-                (&val as *const u32).cast::<c_void>(),
-            )
-        };
-        if st != 0 {
-            *cache = VolCache::default();
-            return Err(format!("CoreAudio set mute failed (OSStatus {st})"));
+        for &el in &cache.mute_elements {
+            let addr = prop_addr(
+                kAudioDevicePropertyMute,
+                kAudioObjectPropertyScopeOutput,
+                el,
+            );
+            let st = unsafe {
+                AudioObjectSetPropertyData(
+                    dev,
+                    &addr,
+                    0,
+                    null(),
+                    size_of::<u32>() as u32,
+                    (&val as *const u32).cast::<c_void>(),
+                )
+            };
+            if st != 0 {
+                *cache = VolCache::default();
+                return Err(format!("CoreAudio set mute failed (OSStatus {st})"));
+            }
         }
         Ok(())
     }
@@ -1370,6 +1460,10 @@ mod tests {
             .expect("96kHz 24-bit must match");
         assert_eq!(asbd.mSampleRate, 96_000.0);
         assert_eq!(fmt, SampleFormat::S24Packed);
+
+        // 192 kHz on a 96 kHz-max DragonFly Black must return None rather than
+        // silently playing at half speed.
+        assert!(select_best_physical_format(&available, PcmSpec::new(192_000, 2, 24)).is_none());
     }
 
     #[test]

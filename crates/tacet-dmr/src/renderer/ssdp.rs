@@ -120,8 +120,8 @@ fn build_multicast_socket(iface: Ipv4Addr) -> Result<std::net::UdpSocket, String
     let _ = sock.set_multicast_loop_v4(true);
     let _ = sock.set_multicast_ttl_v4(4);
     let _ = sock.set_multicast_if_v4(&iface);
-    let _ = sock.join_multicast_v4(&SSDP_MULTICAST_V4, &iface);
-    if iface != Ipv4Addr::UNSPECIFIED {
+    if sock.join_multicast_v4(&SSDP_MULTICAST_V4, &iface).is_err() && iface != Ipv4Addr::UNSPECIFIED
+    {
         let _ = sock.join_multicast_v4(&SSDP_MULTICAST_V4, &Ipv4Addr::UNSPECIFIED);
     }
 

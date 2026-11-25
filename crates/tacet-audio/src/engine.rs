@@ -42,6 +42,7 @@ impl Default for EngineConfig {
 pub enum PlaybackEvent {
     /// First track opened and audio output stream started.
     Ready {
+        session_id: u64,
         url: String,
         spec: PcmSpec,
         duration_secs: Option<f64>,
@@ -49,15 +50,27 @@ pub enum PlaybackEvent {
     },
     /// Playback seamlessly transitioned to the queued next track.
     TrackChanged {
+        session_id: u64,
         url: String,
         spec: PcmSpec,
         duration_secs: Option<f64>,
         active: ActiveOutput,
     },
     /// Playback reached the end of the current track with no queued next track.
-    TrackEnded,
+    TrackEnded { session_id: u64 },
     /// Unrecoverable playback error.
-    Error(String),
+    Error { session_id: u64, message: String },
+}
+
+impl PlaybackEvent {
+    pub fn session_id(&self) -> u64 {
+        match self {
+            Self::Ready { session_id, .. }
+            | Self::TrackChanged { session_id, .. }
+            | Self::TrackEnded { session_id }
+            | Self::Error { session_id, .. } => *session_id,
+        }
+    }
 }
 
 /// Fast-path playback position snapshot.
@@ -103,6 +116,7 @@ enum WorkerCmd {
 }
 
 struct Session {
+    id: u64,
     cancel: Arc<AtomicBool>,
     shared: Arc<StreamShared>,
     cmd_tx: Sender<WorkerCmd>,
@@ -114,7 +128,23 @@ impl Session {
         self.cancel.store(true, Ordering::Release);
         self.shared.stop.store(true, Ordering::Release);
         if let Some(h) = self.worker.take() {
-            let _ = h.join();
+            // Fast path: wait up to 200 ms so normal playback releases exclusive
+            // hardware locks synchronously before the next open(). If the worker
+            // is blocked inside a stalled HTTP connect/read, finish joining on a
+            // detached reaper thread so callers (including Tokio workers) never hang.
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                let _ = thread::Builder::new()
+                    .name("tacet-session-reaper".into())
+                    .spawn(move || {
+                        let _ = h.join();
+                    });
+            }
         }
     }
 }
@@ -131,12 +161,30 @@ pub struct Player {
 }
 
 struct PlayerInner {
+    next_session_id: u64,
     session: Option<Session>,
     paused: bool,
     volume: u8,
     muted: bool,
     hw_vol: Option<Arc<dyn HardwareVolume>>,
     queued_next: Option<String>,
+}
+
+/// Apply current volume/mute state to hardware (when available) and return the
+/// resulting software Q16 gain. Never clobbers software mute when a DAC exposes
+/// hardware volume without hardware mute.
+fn apply_output_gain(st: &mut PlayerInner) -> i64 {
+    if let Some(hv) = st.hw_vol.clone() {
+        if hv.set_volume(st.volume).is_ok() {
+            if hv.set_mute(st.muted).is_ok() {
+                return 1 << 16;
+            }
+            return if st.muted { 0 } else { 1 << 16 };
+        }
+        // Hardware device disappeared or rejected control; fall back to software.
+        st.hw_vol = None;
+    }
+    volume_gain_q16(st.volume, st.muted)
 }
 
 impl Player {
@@ -161,6 +209,7 @@ impl Player {
         let player = Self {
             cfg,
             inner: Mutex::new(PlayerInner {
+                next_session_id: 1,
                 session: None,
                 paused: false,
                 volume,
@@ -181,10 +230,21 @@ impl Player {
         Ok((player, rx))
     }
 
+    /// Current active session ID, or `0` if stopped.
+    pub fn current_session_id(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .session
+            .as_ref()
+            .map(|s| s.id)
+            .unwrap_or(0)
+    }
+
     /// Open `url` (HTTP/HTTPS or local file) and begin playback (or start paused
     /// if `paused` is true). Cancels any active session cleanly before opening
     /// the new one so exclusive hardware locks are released first.
-    pub fn open(&self, url: &str, paused: bool) -> Result<(), String> {
+    pub fn open(&self, url: &str, paused: bool) -> Result<u64, String> {
         // Stop any existing session outside the lock so worker join cannot deadlock.
         let prev = {
             let mut st = self.inner.lock().unwrap();
@@ -207,23 +267,18 @@ impl Player {
             t.pending_transitions.clear();
         }
 
-        let (gain_q16, hw_vol_present) = {
+        let (session_id, gain_q16) = {
             let mut st = self.inner.lock().unwrap();
+            let id = st.next_session_id;
+            st.next_session_id = st.next_session_id.wrapping_add(1).max(1);
             // Re-probe hardware volume on open in case a USB DAC was hotplugged.
             let exclusive = sink::is_exclusive_target(&self.cfg.audio_device, self.cfg.exclusive);
             if st.hw_vol.is_none() {
                 st.hw_vol = sink::open_hardware_volume(&self.cfg.audio_device, exclusive);
             }
-            if let Some(hv) = &st.hw_vol {
-                // Keep software gain at unity when hardware volume is active.
-                let _ = hv.set_volume(st.volume);
-                let _ = hv.set_mute(st.muted);
-                (1i64 << 16, true)
-            } else {
-                (volume_gain_q16(st.volume, st.muted), false)
-            }
+            let gain = apply_output_gain(&mut st);
+            (id, gain)
         };
-        let _ = hw_vol_present;
 
         let cancel = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(StreamShared::new(paused, gain_q16));
@@ -241,19 +296,21 @@ impl Player {
             .name("tacet-audio-worker".into())
             .spawn(move || {
                 run_worker(
-                    url_owned, target, exclusive, cancel_bg, shared_bg, timing_bg, cmd_rx, event_tx,
+                    session_id, url_owned, target, exclusive, cancel_bg, shared_bg, timing_bg,
+                    cmd_rx, event_tx,
                 );
             })
             .map_err(|e| format!("spawn audio worker: {e}"))?;
 
         let mut st = self.inner.lock().unwrap();
         st.session = Some(Session {
+            id: session_id,
             cancel,
             shared,
             cmd_tx,
             worker: Some(worker),
         });
-        Ok(())
+        Ok(session_id)
     }
 
     /// Queue a successor URL for gapless transition when the current track ends.
@@ -331,17 +388,7 @@ impl Player {
         let volume = volume.min(100);
         let mut st = self.inner.lock().unwrap();
         st.volume = volume;
-        if let Some(hv) = &st.hw_vol {
-            if hv.set_volume(volume).is_ok() {
-                if let Some(sess) = &st.session {
-                    sess.shared.gain_q16.store(1 << 16, Ordering::Relaxed);
-                }
-                return Ok(());
-            }
-            // Hardware device disappeared or rejected control; fall back to software.
-            st.hw_vol = None;
-        }
-        let gain = volume_gain_q16(st.volume, st.muted);
+        let gain = apply_output_gain(&mut st);
         if let Some(sess) = &st.session {
             sess.shared.gain_q16.store(gain, Ordering::Relaxed);
         }
@@ -352,21 +399,7 @@ impl Player {
     pub fn set_mute(&self, muted: bool) -> Result<(), String> {
         let mut st = self.inner.lock().unwrap();
         st.muted = muted;
-        if let Some(hv) = &st.hw_vol {
-            if hv.set_mute(muted).is_ok() {
-                if let Some(sess) = &st.session {
-                    sess.shared.gain_q16.store(1 << 16, Ordering::Relaxed);
-                }
-                return Ok(());
-            }
-            // Some USB DACs expose volume scalar without hardware mute; mute in software.
-            let gain = if muted { 0 } else { 1 << 16 };
-            if let Some(sess) = &st.session {
-                sess.shared.gain_q16.store(gain, Ordering::Relaxed);
-            }
-            return Ok(());
-        }
-        let gain = volume_gain_q16(st.volume, st.muted);
+        let gain = apply_output_gain(&mut st);
         if let Some(sess) = &st.session {
             sess.shared.gain_q16.store(gain, Ordering::Relaxed);
         }
@@ -458,12 +491,30 @@ fn emit(tx: &Option<Sender<PlaybackEvent>>, ev: PlaybackEvent) {
 }
 
 fn buffer_capacity_samples(spec: PcmSpec) -> usize {
-    // ~1.5 s ringbuffer, clamped to [64K, 1.5M] samples (~256 KiB .. 6 MiB).
-    let target = (spec.sample_rate as usize) * (spec.channels.max(1) as usize) * 3 / 2;
-    target.clamp(65_536, 1_572_864)
+    // ~1.5 s ringbuffer, clamped to [64K, 1.5M] samples (~256 KiB .. 6 MiB),
+    // rounded down to an exact multiple of channel count so frames never split.
+    let ch = spec.channels.max(1) as usize;
+    let target = (spec.sample_rate as usize) * ch * 3 / 2;
+    let clamped = target.clamp(65_536, 1_572_864);
+    (clamped / ch).max(1) * ch
+}
+
+/// Request a ringbuffer flush on the sink and wait briefly for the sink to
+/// observe and complete it so post-seek samples are never discarded.
+fn wait_for_flush(shared: &StreamShared, cancel: &AtomicBool) {
+    shared.flush_ring.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    while shared.flush_ring.load(Ordering::Acquire)
+        && !cancel.load(Ordering::Relaxed)
+        && !shared.is_failed()
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn advance_pending_transitions(
+    session_id: u64,
     frames_played: u64,
     timing: &Arc<Mutex<TimingState>>,
     event_tx: &Option<Sender<PlaybackEvent>>,
@@ -480,6 +531,7 @@ fn advance_pending_transitions(
                 t.duration_secs = tr.info.duration_secs.unwrap_or(0.0);
                 t.active = Some(tr.active.clone());
                 emitted.push(PlaybackEvent::TrackChanged {
+                    session_id,
                     url: tr.url,
                     spec: tr.info.spec,
                     duration_secs: tr.info.duration_secs,
@@ -497,6 +549,7 @@ fn advance_pending_transitions(
 
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
+    session_id: u64,
     initial_url: String,
     target: String,
     exclusive: bool,
@@ -510,7 +563,13 @@ fn run_worker(
         Ok(d) => d,
         Err(e) => {
             if !cancel.load(Ordering::Relaxed) {
-                emit(&event_tx, PlaybackEvent::Error(e));
+                emit(
+                    &event_tx,
+                    PlaybackEvent::Error {
+                        session_id,
+                        message: e,
+                    },
+                );
             }
             return;
         }
@@ -524,7 +583,13 @@ fn run_worker(
             Ok(s) => s,
             Err(e) => {
                 if !cancel.load(Ordering::Relaxed) {
-                    emit(&event_tx, PlaybackEvent::Error(e));
+                    emit(
+                        &event_tx,
+                        PlaybackEvent::Error {
+                            session_id,
+                            message: e,
+                        },
+                    );
                 }
                 return;
             }
@@ -542,6 +607,7 @@ fn run_worker(
     emit(
         &event_tx,
         PlaybackEvent::Ready {
+            session_id,
             url: initial_url,
             spec: cur_spec,
             duration_secs: decoder.info().duration_secs,
@@ -558,6 +624,16 @@ fn run_worker(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
+        if shared.is_failed() {
+            emit(
+                &event_tx,
+                PlaybackEvent::Error {
+                    session_id,
+                    message: "audio output device failed or disconnected".into(),
+                },
+            );
+            break;
+        }
 
         // Process any queued control commands (Seek / QueueNext).
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -569,7 +645,7 @@ fn run_worker(
                     if let Ok(landed) = decoder.seek(sec) {
                         pending_samples.clear();
                         pending_offset = 0;
-                        shared.flush_ring.store(true, Ordering::Release);
+                        wait_for_flush(&shared, &cancel);
                         let cur_played = shared.frames_played();
                         frames_pushed = cur_played;
                         let mut t = timing.lock().unwrap();
@@ -582,13 +658,14 @@ fn run_worker(
         }
 
         // Advance any gapless track boundaries that the hardware just crossed.
-        advance_pending_transitions(shared.frames_played(), &timing, &event_tx);
+        advance_pending_transitions(session_id, shared.frames_played(), &timing, &event_tx);
 
+        let ch = cur_spec.channels.max(1) as usize;
         // Push leftover samples from the previous decoded chunk first.
         if pending_offset < pending_samples.len() {
-            let written = push_samples(&mut producer, &pending_samples[pending_offset..]);
+            let written = push_samples(&mut producer, &pending_samples[pending_offset..], ch);
             pending_offset += written;
-            frames_pushed += (written / cur_spec.channels.max(1) as usize) as u64;
+            frames_pushed += (written / ch) as u64;
             if pending_offset < pending_samples.len() {
                 thread::sleep(Duration::from_millis(5));
                 continue;
@@ -600,8 +677,8 @@ fn run_worker(
         // Decode next audio chunk.
         match decoder.next_chunk() {
             Ok(Some(samples)) => {
-                let written = push_samples(&mut producer, samples);
-                frames_pushed += (written / cur_spec.channels.max(1) as usize) as u64;
+                let written = push_samples(&mut producer, samples, ch);
+                frames_pushed += (written / ch) as u64;
                 if written < samples.len() {
                     pending_samples.extend_from_slice(&samples[written..]);
                     pending_offset = 0;
@@ -609,10 +686,24 @@ fn run_worker(
                 }
             }
             Ok(None) => {
-                // Current track reached EOF. Check if a gapless next track is queued.
+                // Current track reached EOF. Check for pending QueueNext or Seek.
                 while let Ok(cmd) = cmd_rx.try_recv() {
-                    if let WorkerCmd::QueueNext(next) = cmd {
-                        queued_next = next;
+                    match cmd {
+                        WorkerCmd::QueueNext(next) => {
+                            queued_next = next;
+                        }
+                        WorkerCmd::Seek(sec) => {
+                            if let Ok(landed) = decoder.seek(sec) {
+                                wait_for_flush(&shared, &cancel);
+                                let cur_played = shared.frames_played();
+                                frames_pushed = cur_played;
+                                let mut t = timing.lock().unwrap();
+                                t.base_frame = cur_played;
+                                t.base_secs = landed;
+                                t.pending_transitions.clear();
+                                continue 'outer;
+                            }
+                        }
                     }
                 }
 
@@ -640,8 +731,12 @@ fn run_worker(
                             // Sample rate or channel count changed: drain current track cleanly,
                             // then reconfigure hardware for the new format.
                             shared.draining.store(true, Ordering::Release);
-                            while !shared.is_finished() && !cancel.load(Ordering::Relaxed) {
+                            while !shared.is_finished()
+                                && !shared.is_failed()
+                                && !cancel.load(Ordering::Relaxed)
+                            {
                                 advance_pending_transitions(
+                                    session_id,
                                     shared.frames_played(),
                                     &timing,
                                     &event_tx,
@@ -651,12 +746,24 @@ fn run_worker(
                             if cancel.load(Ordering::Relaxed) {
                                 break 'outer;
                             }
+                            if shared.is_failed() {
+                                emit(
+                                    &event_tx,
+                                    PlaybackEvent::Error {
+                                        session_id,
+                                        message: "audio output device failed or disconnected"
+                                            .into(),
+                                    },
+                                );
+                                break 'outer;
+                            }
 
                             // Release old output stream before opening new rate/format.
                             drop(stream);
                             shared.stop.store(false, Ordering::Release);
                             shared.draining.store(false, Ordering::Release);
                             shared.finished.store(false, Ordering::Release);
+                            shared.failed.store(false, Ordering::Release);
                             shared.frames_played.store(0, Ordering::Release);
                             frames_pushed = 0;
 
@@ -674,7 +781,13 @@ fn run_worker(
                                 Ok(s) => s,
                                 Err(e) => {
                                     if !cancel.load(Ordering::Relaxed) {
-                                        emit(&event_tx, PlaybackEvent::Error(e));
+                                        emit(
+                                            &event_tx,
+                                            PlaybackEvent::Error {
+                                                session_id,
+                                                message: e,
+                                            },
+                                        );
                                     }
                                     return;
                                 }
@@ -692,6 +805,7 @@ fn run_worker(
                             emit(
                                 &event_tx,
                                 PlaybackEvent::TrackChanged {
+                                    session_id,
                                     url: next_url,
                                     spec: cur_spec,
                                     duration_secs: next_info.duration_secs,
@@ -703,7 +817,13 @@ fn run_worker(
                         }
                         Err(e) => {
                             if !cancel.load(Ordering::Relaxed) {
-                                emit(&event_tx, PlaybackEvent::Error(e));
+                                emit(
+                                    &event_tx,
+                                    PlaybackEvent::Error {
+                                        session_id,
+                                        message: e,
+                                    },
+                                );
                             }
                             break 'outer;
                         }
@@ -712,27 +832,32 @@ fn run_worker(
 
                 // No next track queued: drain remaining buffered audio cleanly.
                 shared.draining.store(true, Ordering::Release);
-                while !shared.is_finished() && !cancel.load(Ordering::Relaxed) {
-                    advance_pending_transitions(shared.frames_played(), &timing, &event_tx);
+                while !shared.is_finished()
+                    && !shared.is_failed()
+                    && !cancel.load(Ordering::Relaxed)
+                {
+                    advance_pending_transitions(
+                        session_id,
+                        shared.frames_played(),
+                        &timing,
+                        &event_tx,
+                    );
                     // Allow late queue_next or seek while draining.
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             WorkerCmd::QueueNext(Some(next_url)) => {
-                                shared.draining.store(false, Ordering::Release);
-                                queued_next = Some(next_url);
-                                // Re-enter EOF handler by opening right away if compatible.
-                                if let Ok(next_dec) = AudioDecoder::open(
-                                    queued_next.as_ref().unwrap(),
-                                    Arc::clone(&cancel),
-                                ) && next_dec.info().spec.hardware_compatible(cur_spec)
+                                if let Ok(next_dec) =
+                                    AudioDecoder::open(&next_url, Arc::clone(&cancel))
+                                    && next_dec.info().spec.hardware_compatible(cur_spec)
+                                    && !shared.is_finished()
                                 {
-                                    let url = queued_next.take().unwrap();
+                                    shared.draining.store(false, Ordering::Release);
                                     let boundary = frames_pushed;
                                     let active = stream.active_output().clone();
                                     let mut t = timing.lock().unwrap();
                                     t.pending_transitions.push_back(PendingTransition {
                                         boundary_frame: boundary,
-                                        url,
+                                        url: next_url,
                                         info: next_dec.info().clone(),
                                         active,
                                     });
@@ -740,6 +865,9 @@ fn run_worker(
                                     decoder = next_dec;
                                     continue 'outer;
                                 }
+                                // If incompatible format or open failed, keep draining
+                                // so TrackEnded fires and the controller opens it cleanly.
+                                shared.draining.store(true, Ordering::Release);
                             }
                             WorkerCmd::QueueNext(None) => {
                                 queued_next = None;
@@ -748,7 +876,7 @@ fn run_worker(
                                 if let Ok(landed) = decoder.seek(sec) {
                                     shared.draining.store(false, Ordering::Release);
                                     shared.finished.store(false, Ordering::Release);
-                                    shared.flush_ring.store(true, Ordering::Release);
+                                    wait_for_flush(&shared, &cancel);
                                     let cur_played = shared.frames_played();
                                     frames_pushed = cur_played;
                                     let mut t = timing.lock().unwrap();
@@ -764,14 +892,35 @@ fn run_worker(
                 }
 
                 if !cancel.load(Ordering::Relaxed) {
-                    advance_pending_transitions(shared.frames_played(), &timing, &event_tx);
-                    emit(&event_tx, PlaybackEvent::TrackEnded);
+                    if shared.is_failed() {
+                        emit(
+                            &event_tx,
+                            PlaybackEvent::Error {
+                                session_id,
+                                message: "audio output device failed or disconnected".into(),
+                            },
+                        );
+                    } else {
+                        advance_pending_transitions(
+                            session_id,
+                            shared.frames_played(),
+                            &timing,
+                            &event_tx,
+                        );
+                        emit(&event_tx, PlaybackEvent::TrackEnded { session_id });
+                    }
                 }
                 break 'outer;
             }
             Err(e) => {
                 if !cancel.load(Ordering::Relaxed) {
-                    emit(&event_tx, PlaybackEvent::Error(e));
+                    emit(
+                        &event_tx,
+                        PlaybackEvent::Error {
+                            session_id,
+                            message: e,
+                        },
+                    );
                 }
                 break 'outer;
             }
@@ -781,12 +930,13 @@ fn run_worker(
     drop(stream);
 }
 
-fn push_samples(producer: &mut Producer<i32>, samples: &[i32]) -> usize {
+fn push_samples(producer: &mut Producer<i32>, samples: &[i32], channels: usize) -> usize {
+    let ch = channels.max(1);
     let avail = producer.slots();
-    if avail == 0 || samples.is_empty() {
+    let take = (avail.min(samples.len()) / ch) * ch;
+    if take == 0 {
         return 0;
     }
-    let take = avail.min(samples.len());
     if let Ok(mut chunk) = producer.write_chunk_uninit(take) {
         let (s1, s2) = chunk.as_mut_slices();
         let n1 = s1.len();
@@ -863,10 +1013,10 @@ mod tests {
                         assert_eq!(spec.channels, 2);
                         saw_ready = true;
                     }
-                    PlaybackEvent::TrackEnded => {
+                    PlaybackEvent::TrackEnded { .. } => {
                         saw_ended = true;
                     }
-                    PlaybackEvent::Error(e) => panic!("unexpected error: {e}"),
+                    PlaybackEvent::Error { message: e, .. } => panic!("unexpected error: {e}"),
                     _ => {}
                 }
             }
@@ -909,8 +1059,8 @@ mod tests {
             if let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
                 match ev {
                     PlaybackEvent::TrackChanged { .. } => saw_changed = true,
-                    PlaybackEvent::TrackEnded => saw_ended = true,
-                    PlaybackEvent::Error(e) => panic!("unexpected error: {e}"),
+                    PlaybackEvent::TrackEnded { .. } => saw_ended = true,
+                    PlaybackEvent::Error { message: e, .. } => panic!("unexpected error: {e}"),
                     _ => {}
                 }
             }
@@ -923,5 +1073,49 @@ mod tests {
         // Exact total bytes = (4410 + 4410) frames * 2 channels * 2 bytes/sample = 35280 bytes.
         assert_eq!(meta.len(), (4_410 + 4_410) * 2 * 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn buffer_capacity_is_always_frame_aligned() {
+        for ch in [1u16, 2, 3, 6, 8] {
+            let cap = buffer_capacity_samples(PcmSpec {
+                sample_rate: 44_100,
+                channels: ch,
+                bits_per_sample: 24,
+            });
+            assert_eq!(cap % (ch as usize), 0);
+        }
+    }
+
+    #[test]
+    fn hw_vol_without_hw_mute_preserves_software_mute() {
+        struct VolOnlyHw;
+        impl HardwareVolume for VolOnlyHw {
+            fn get_volume(&self) -> Result<u8, String> {
+                Ok(50)
+            }
+            fn set_volume(&self, _v: u8) -> Result<(), String> {
+                Ok(())
+            }
+            fn get_mute(&self) -> Result<bool, String> {
+                Err("no hw mute".into())
+            }
+            fn set_mute(&self, _m: bool) -> Result<(), String> {
+                Err("no hw mute".into())
+            }
+        }
+        let mut st = PlayerInner {
+            next_session_id: 1,
+            session: None,
+            paused: false,
+            volume: 80,
+            muted: true,
+            hw_vol: Some(Arc::new(VolOnlyHw)),
+            queued_next: None,
+        };
+        // Changing volume while muted must keep software gain at 0.
+        assert_eq!(apply_output_gain(&mut st), 0);
+        st.muted = false;
+        assert_eq!(apply_output_gain(&mut st), 1 << 16);
     }
 }

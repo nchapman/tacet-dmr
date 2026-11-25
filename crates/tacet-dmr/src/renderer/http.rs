@@ -42,12 +42,11 @@ enum IpRule {
     V4Prefix { net: u32, mask: u32 },
 }
 
+const MAX_SUBSCRIPTIONS: usize = 64;
+
 impl ControllerFilter {
     pub fn parse(raw: &str) -> Result<Self, String> {
         let raw = raw.trim();
-        if raw.is_empty() {
-            return Ok(Self::default());
-        }
         let mut rules = Vec::new();
         for part in raw.split(',') {
             let p = part.trim();
@@ -76,12 +75,15 @@ impl ControllerFilter {
                 rules.push(IpRule::Exact(normalize_ip(ip)));
             }
         }
+        if rules.is_empty() {
+            return Err("controller allowlist must contain at least one IP or CIDR".into());
+        }
         Ok(Self { rules })
     }
 
     pub fn allows(&self, peer: IpAddr) -> bool {
         if self.rules.is_empty() {
-            return true;
+            return false;
         }
         let peer = normalize_ip(peer);
         for rule in &self.rules {
@@ -158,7 +160,7 @@ impl Device {
 /// - 50 ms playback event polling while active.
 /// - 500 ms hardware volume sync when RenderingControl subscribers exist.
 pub async fn run_monitor(dev: Arc<Device>, mut shutdown_rx: watch::Receiver<bool>) {
-    let mut last_vol_sync = Instant::now() - Duration::from_secs(10);
+    let mut last_vol_sync: Option<Instant> = None;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -174,9 +176,11 @@ pub async fn run_monitor(dev: Arc<Device>, mut shutdown_rx: watch::Receiver<bool
             let active = st.transport.is_active();
             let has_rc = st.subs.has_rc_subs();
 
-            if has_rc && now.duration_since(last_vol_sync) >= Duration::from_millis(500) {
+            if has_rc
+                && last_vol_sync.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(500))
+            {
                 st.transport.sync_volume();
-                last_vol_sync = now;
+                last_vol_sync = Some(now);
                 changed = true;
             }
 
@@ -196,7 +200,8 @@ pub async fn run_monitor(dev: Arc<Device>, mut shutdown_rx: watch::Receiver<bool
                 consider(Duration::from_millis(50));
             }
             if has_rc {
-                let since = now.duration_since(last_vol_sync);
+                let since =
+                    last_vol_sync.map_or(Duration::from_millis(500), |t| now.duration_since(t));
                 consider(
                     Duration::from_millis(500)
                         .saturating_sub(since)
@@ -506,27 +511,36 @@ fn handle_events(
     };
 
     let sid = format!("uuid:{}", Uuid::new_v4());
-    let (initial, rx, stop_rx) = {
+    let sub_init = {
         let mut st = dev.state.lock().unwrap();
-        if service == "RenderingControl" {
-            st.transport.sync_volume();
+        let now = Instant::now();
+        st.subs.expire_stale(now);
+        if st.subs.subs.len() >= MAX_SUBSCRIPTIONS {
+            None
+        } else {
+            if service == "RenderingControl" {
+                st.transport.sync_volume();
+            }
+            let initial = st.transport.event_state();
+            let (tx, rx) = watch::channel(initial.clone());
+            let (stop_tx, stop_rx) = watch::channel(false);
+            st.subs.subs.insert(
+                sid.clone(),
+                Subscription {
+                    sid: sid.clone(),
+                    service: service.to_string(),
+                    callback: callback.clone(),
+                    peer: peer_norm,
+                    expires: now + Duration::from_secs(timeout_sec),
+                    tx,
+                    stop_tx,
+                },
+            );
+            Some((initial, rx, stop_rx))
         }
-        let initial = st.transport.event_state();
-        let (tx, rx) = watch::channel(initial.clone());
-        let (stop_tx, stop_rx) = watch::channel(false);
-        st.subs.subs.insert(
-            sid.clone(),
-            Subscription {
-                sid: sid.clone(),
-                service: service.to_string(),
-                callback: callback.clone(),
-                peer: peer_norm,
-                expires: Instant::now() + Duration::from_secs(timeout_sec),
-                tx,
-                stop_tx,
-            },
-        );
-        (initial, rx, stop_rx)
+    };
+    let Some((initial, rx, stop_rx)) = sub_init else {
+        return resp_with(StatusCode::SERVICE_UNAVAILABLE, None, String::new());
     };
     dev.nudge();
 
@@ -660,6 +674,12 @@ mod tests {
         assert!(f.allows("127.0.0.1".parse().unwrap()));
         assert!(!f.allows("192.168.2.1".parse().unwrap()));
         assert!(!f.allows("10.0.0.1".parse().unwrap()));
+
+        // Comma/whitespace-only allowlists must fail closed.
+        assert!(ControllerFilter::parse("").is_err());
+        assert!(ControllerFilter::parse(",").is_err());
+        assert!(ControllerFilter::parse(" , , ").is_err());
+        assert!(!ControllerFilter::default().allows("127.0.0.1".parse().unwrap()));
     }
 
     #[test]

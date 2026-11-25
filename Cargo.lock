@@ -983,6 +983,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
+ "libc",
  "quick-xml",
  "rand",
  "socket2",

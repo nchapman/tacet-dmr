@@ -44,6 +44,7 @@ pub struct StreamShared {
     pub paused: AtomicBool,
     pub draining: AtomicBool,
     pub finished: AtomicBool,
+    pub failed: AtomicBool,
     pub stop: AtomicBool,
     pub flush_ring: AtomicBool,
     pub gain_q16: AtomicI64,
@@ -57,6 +58,7 @@ impl StreamShared {
             paused: AtomicBool::new(paused),
             draining: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             flush_ring: AtomicBool::new(false),
             gain_q16: AtomicI64::new(gain_q16),
@@ -65,16 +67,19 @@ impl StreamShared {
         }
     }
 
-    /// If a seek flush was requested, discard all currently queued samples in `consumer`.
+    /// If a seek flush was requested, discard all currently queued complete frames
+    /// in `consumer`, then clear `flush_ring` with Release ordering so the producer
+    /// waiting on `!flush_ring` sees the completed flush.
     #[inline]
     pub fn maybe_flush(&self, consumer: &mut Consumer<i32>) {
-        if self.flush_ring.swap(false, Ordering::AcqRel) {
+        if self.flush_ring.load(Ordering::Acquire) {
             let n = consumer.slots();
             if n > 0
                 && let Ok(chunk) = consumer.read_chunk(n)
             {
                 chunk.commit_all();
             }
+            self.flush_ring.store(false, Ordering::Release);
         }
     }
 
@@ -91,6 +96,11 @@ impl StreamShared {
     #[inline]
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
     }
 
     #[inline]

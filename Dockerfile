@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.88-bookworm AS build
+FROM rust:1.90-bookworm AS build
 ARG VERSION=dev
 ENV TACET_DMR_VERSION=${VERSION}
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --bin tacet-dmr
+RUN cargo build --release --locked --bin tacet-dmr
 
 FROM build AS check
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:0.12.14 /uv /usr/local/bin/uv
 COPY interop ./interop
 COPY scripts ./scripts
-RUN cargo test --workspace \
+RUN cargo test --workspace --locked \
     && DMR_TEST_BIN=/src/target/release/tacet-dmr \
        uv run --project interop python -m unittest discover -s interop -v
 
