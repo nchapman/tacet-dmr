@@ -201,8 +201,8 @@ pub fn open_stream(
                     .get_audiorenderclient()
                     .map_err(|e| format!("WASAPI get_audiorenderclient: {e}"))?;
                 let buffer_frames = client
-                    .get_bufferframecount()
-                    .map_err(|e| format!("WASAPI get_bufferframecount: {e}"))?
+                    .get_buffer_size()
+                    .map_err(|e| format!("WASAPI get_buffer_size: {e}"))?
                     as usize;
 
                 // Pre-fill initial silence buffer before start_stream() per WASAPI spec.
@@ -364,6 +364,6 @@ impl Drop for WasapiStream {
 
 /// Hardware endpoint volume is not yet bound via raw COM on Windows;
 /// `tacet-audio` transparently falls back to integer Q16 software gain.
-pub fn open_hardware_volume(_id: Option<&str>) -> Option<Box<dyn HardwareVolume>> {
+pub fn open_hardware_volume(_id: Option<&str>) -> Option<Arc<dyn HardwareVolume>> {
     None
 }

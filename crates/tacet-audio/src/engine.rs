@@ -866,8 +866,9 @@ fn run_worker(
                                     decoder = next_dec;
                                     continue 'outer;
                                 }
-                                // If incompatible format or open failed, keep draining
-                                // so TrackEnded fires and the controller opens it cleanly.
+                                // Keep draining; if a cross-rate track was queued late,
+                                // remember it so we reconfigure hardware right after drain.
+                                queued_next = Some(next_url);
                                 shared.draining.store(true, Ordering::Release);
                             }
                             WorkerCmd::QueueNext(None) => {
@@ -890,6 +891,85 @@ fn run_worker(
                         }
                     }
                     thread::sleep(Duration::from_millis(5));
+                }
+
+                if !cancel.load(Ordering::Relaxed)
+                    && !shared.is_failed()
+                    && let Some(next_url) = queued_next.take()
+                {
+                    // A cross-rate successor arrived while draining: reconfigure hardware now.
+                    match AudioDecoder::open(&next_url, Arc::clone(&cancel)) {
+                        Ok(next_dec) => {
+                            let next_info = next_dec.info().clone();
+                            drop(stream);
+                            shared.stop.store(false, Ordering::Release);
+                            shared.draining.store(false, Ordering::Release);
+                            shared.finished.store(false, Ordering::Release);
+                            shared.failed.store(false, Ordering::Release);
+                            shared.frames_played.store(0, Ordering::Release);
+                            frames_pushed = 0;
+
+                            cur_spec = next_info.spec;
+                            let (new_prod, new_cons) =
+                                RingBuffer::<i32>::new(buffer_capacity_samples(cur_spec));
+                            producer = new_prod;
+                            stream = match sink::open_stream(
+                                &target,
+                                exclusive,
+                                cur_spec,
+                                new_cons,
+                                Arc::clone(&shared),
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    if !cancel.load(Ordering::Relaxed) {
+                                        emit(
+                                            &event_tx,
+                                            PlaybackEvent::Error {
+                                                session_id,
+                                                message: e,
+                                            },
+                                        );
+                                    }
+                                    return;
+                                }
+                            };
+                            let active = stream.active_output().clone();
+                            {
+                                let mut t = timing.lock().unwrap();
+                                t.sample_rate = cur_spec.sample_rate;
+                                t.base_frame = 0;
+                                t.base_secs = 0.0;
+                                t.duration_secs = next_info.duration_secs.unwrap_or(0.0);
+                                t.active = Some(active.clone());
+                                t.pending_transitions.clear();
+                            }
+                            emit(
+                                &event_tx,
+                                PlaybackEvent::TrackChanged {
+                                    session_id,
+                                    url: next_url,
+                                    spec: cur_spec,
+                                    duration_secs: next_info.duration_secs,
+                                    active,
+                                },
+                            );
+                            decoder = next_dec;
+                            continue 'outer;
+                        }
+                        Err(e) => {
+                            if !cancel.load(Ordering::Relaxed) {
+                                emit(
+                                    &event_tx,
+                                    PlaybackEvent::Error {
+                                        session_id,
+                                        message: e,
+                                    },
+                                );
+                            }
+                            break 'outer;
+                        }
+                    }
                 }
 
                 if !cancel.load(Ordering::Relaxed) {

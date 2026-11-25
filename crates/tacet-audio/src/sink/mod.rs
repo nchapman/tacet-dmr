@@ -310,7 +310,7 @@ pub fn open_hardware_volume(target: &str, exclusive: bool) -> Option<Arc<dyn Har
     {
         let id = target.strip_prefix("wasapi/");
         let _ = exclusive;
-        wasapi::open_hardware_volume(id).map(|v| Arc::new(v) as Arc<dyn HardwareVolume>)
+        wasapi::open_hardware_volume(id)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
