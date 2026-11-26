@@ -1,38 +1,39 @@
 # tacet-endpoint
 
-A self-contained **OpenHome Media + Songcast** audiophile network audio endpoint written in Rust — with an optional **UPnP AV / DLNA `MediaRenderer:1`** compatibility device on the same port. Exposes a local audio output (built-in speakers, USB DAC, ALSA `hw:`, or WASAPI endpoint) on your LAN so [Tacet](https://github.com/nchapman/tacet), Linn Kazoo, Lumin, BubbleUPnP, or any OpenHome / UPnP AV control point can discover it, play gapless playlists, and group rooms via Songcast.
+Turn any Mac, Linux box, or Windows PC (and its USB DAC) into a bit-exact **OpenHome Media + Songcast** network audio endpoint — with optional **UPnP AV / DLNA** compatibility on the same port.
 
-## Workspace
+Single native Rust binary. Zero `libmpv` or FFmpeg dependencies. Built for [Tacet](https://github.com/nchapman/tacet), Linn Kazoo, Lumin, BubbleUPnP, and any OpenHome or UPnP AV control point.
 
-- **`crates/tacet-audio`**: Reusable cross-platform audiophile playback engine (pure-Rust `symphonia` decoding including Opus, lock-free `rtrb` Q31 integer PCM ringbuffer, gapless track transitions, direct PCM stream input for Songcast Receiver, pre-gain PCM tap for Songcast Sender, and native macOS CoreAudio HAL/AUHAL, Linux ALSA, and Windows WASAPI sinks). Designed for both `tacet-endpoint` and direct in-process embedding in Tauri apps.
-- **`crates/tacet-endpoint`**: OpenHome Media + Songcast + minimal UPnP AV endpoint built on [`openhome-rs`](https://github.com/nchapman/openhome-rs) (`Product:1`, `Playlist:1`, `Info:1`, `Time:1`, `Volume:1`, `Receiver:1`, `Sender:1`, plus optional UPnP `AVTransport:1`, `RenderingControl:1`, `ConnectionManager:1`, dual-device GENA eventing, and dual-device SSDP).
+## Why tacet-endpoint?
 
-## Features
-
-- **Primary OpenHome Media + Songcast stack**:
-  - Device-side `Playlist:1` queue with true gapless transitions, repeat, and shuffle.
-  - Multi-room **Songcast** `Sender:1` (tapping pre-gain unity Q31 PCM from `tacet-audio`) and `Receiver:1` (with proportional-integral clock-drift resampling directly into `tacet-audio`'s exclusive/shared output stream).
-  - Real-time GENA eventing for all OpenHome services and live `Info:1` / `Time:1` audio metadata (`BitDepth`, `SampleRate`, `BitRate`, `CodecName`, `Lossless`).
-- **Minimal UPnP AV / DLNA compatibility device** (enabled by default, disable with `-no-upnp`):
-  - Exposes `MediaRenderer:1` (`AVTransport:1`, `RenderingControl:1`, `ConnectionManager:1`) on `/upnp/description.xml` with its own UDN and `"<Name> (UPnP)"` friendly name so dual-stack control points never collide.
-  - Shares hardware/software volume and mutually arbitrates the active audio source with OpenHome (`Product:1` `UpnpAv` source).
-- **Zero external media-player dependencies**: Single native binary with pure-Rust decoding for FLAC, ALAC, WAV, AIFF, CAF, MP3, AAC, Vorbis, Opus, Ogg, MP4/M4A, and WebM/Matroska (no `libmpv` or FFmpeg install required).
-- **Native audiophile output backends**:
-  - **macOS CoreAudio**: Shared mode via AUHAL, and true **exclusive hog mode** (`kAudioDevicePropertyHogMode`) via direct HAL `AudioDeviceCreateIOProcID` with per-track physical sample-rate switching, **native 3-byte packed 24-bit (`S24Packed`) support** for 24-bit-only USB DACs (such as the AudioQuest DragonFly Black), and native CoreAudio hardware volume/mute.
-  - **Linux ALSA**: Direct `hw:` / `plughw:` / `default` output supporting `S16_LE`, `S24_3LE`, `S24_LE`, `S32_LE`, and `FLOAT_LE`.
+- **Audiophile native output (`tacet-audio`)**: Pure-Rust `symphonia` decoding (FLAC, ALAC, WAV, AIFF, CAF, MP3, AAC, Vorbis, Opus, Ogg, MP4/M4A, WebM) into a lock-free Q31 integer ringbuffer with bit-exact pass-through at unity gain or when hardware volume is active.
+  - **macOS CoreAudio**: Shared mode (AUHAL) or true **exclusive hog mode** (`kAudioDevicePropertyHogMode`) with per-track physical sample-rate switching, native 3-byte packed 24-bit (`S24Packed`) for 24-bit-only USB DACs (e.g. AudioQuest DragonFly Black), and hardware volume/mute.
+  - **Linux ALSA**: Direct `hw:` / `plughw:` / `default` (`S16_LE`, `S24_3LE`, `S24_LE`, `S32_LE`, `FLOAT_LE`).
   - **Windows WASAPI**: Exclusive and shared output (`S16`, `S24`, `S32`, `F32`) with `IAudioEndpointVolume`.
-- **Safety by default**: Explicit `-serve` LAN IP/interface binding, optional `-controller` IPv4/CIDR allowlist gating both OpenHome and UPnP AV, and conservative exclusive startup volume (`30` when software-controlled).
+- **OpenHome Media + Songcast multi-room**: Powered by [`openhome-rs`](https://github.com/nchapman/openhome-rs) (`Product:1`, `Playlist:1`, `Info:1`, `Time:1`, `Volume:1`, `Receiver:1`, `Sender:1`). Device-side gapless playlists, live codec/bit-depth/sample-rate metadata, and Songcast leader/follower streaming with closed-loop PI clock-drift compensation.
+- **Optional UPnP AV / DLNA compatibility**: Exposes `MediaRenderer:1` (`AVTransport:1`, `RenderingControl:1`, `ConnectionManager:1`) on `/upnp/description.xml` with its own UDN and `"<Name> (UPnP)"` friendly name, sharing volume and arbitrating the active source cleanly with OpenHome. Disable with `-no-upnp` for pure OpenHome.
+- **Safe defaults**: Explicit `-serve` interface/IP binding, conservative `30%` startup volume in exclusive mode when software-controlled, optional `-controller` IPv4/CIDR allowlist gating both protocols, and network `file://` URI rejection.
 
 ## Quick start
 
+### Build from source
+
+Requires **Rust 1.89+** (on Linux, also `libasound2-dev` and `pkg-config`).
+
 ```sh
-# Build from source (requires Rust 1.89+; on Linux also libasound2-dev + pkg-config)
 cargo build --release --bin tacet-endpoint
+```
 
-# List available audio outputs
+### 1. Find your audio device
+
+```sh
 ./target/release/tacet-endpoint -list-devices
+```
 
-# Run on macOS with a USB DAC in exclusive hog mode
+### 2. Start the endpoint
+
+```sh
+# macOS with a USB DAC in exclusive hog mode
 ./target/release/tacet-endpoint \
   -serve en0:49152 \
   -room "Living Room" \
@@ -41,7 +42,24 @@ cargo build --release --bin tacet-endpoint
   -exclusive
 ```
 
-## Docker (Linux)
+`tacet-endpoint` prints its active discovery URLs on startup and announces both devices over SSDP:
+
+```text
+TACET_OPENHOME_URL=http://192.168.1.10:49152/description.xml
+TACET_UPNP_URL=http://192.168.1.10:49152/upnp/description.xml
+TACET_SONGCAST_URL=ohz://239.255.255.250:51972/...
+```
+
+To restrict access to specific LAN hosts or subnets, pass `-controller`:
+
+```sh
+./target/release/tacet-endpoint \
+  -serve en0:49152 \
+  -controller 192.168.1.0/24 \
+  -name "Desk DAC"
+```
+
+### Docker (Linux)
 
 ```sh
 docker run --rm --net=host --device /dev/snd \
@@ -52,15 +70,31 @@ docker run --rm --net=host --device /dev/snd \
   -device alsa/default
 ```
 
-## Testing
+### Local playback
+
+Without `-serve`, `tacet-endpoint` plays local audio files directly through `tacet-audio`:
 
 ```sh
-# Full local check: clippy, Rust unit + integration tests (OpenHome, Songcast, UPnP AV),
-# and Python black-box async_upnp_client interop suite
-sh scripts/check.sh
+./target/release/tacet-endpoint -device "coreaudio/<device-uid>" -exclusive track1.flac track2.flac
 ```
 
-See [`docs/renderer.md`](docs/renderer.md) for CLI flags, protocol details, and architecture notes.
+## Scope
+
+- **Does**: Network audio playback (OpenHome `Playlist:1`, Songcast `Receiver:1` / `Sender:1`, UPnP `AVTransport:1`), gapless transitions, hardware/software volume control, and multi-room Songcast grouping.
+- **Does not**: Host a media library / UPnP ContentDirectory server, or decode DSD/WMA/APE/WavPack (those MIME types are intentionally omitted from `GetProtocolInfo` so control points transcode automatically).
+
+## Workspace
+
+| Crate | Purpose |
+| --- | --- |
+| [`crates/tacet-audio`](crates/tacet-audio) | Reusable cross-platform audiophile playback engine (embeddable in Rust/Tauri apps). |
+| [`crates/tacet-endpoint`](crates/tacet-endpoint) | OpenHome Media + Songcast + UPnP AV endpoint library and standalone CLI binary. |
+
+## Documentation
+
+- [`docs/renderer.md`](docs/renderer.md) — CLI flags, startup markers, service endpoints, and source arbitration.
+- [`docs/playback.md`](docs/playback.md) — `tacet-audio` pipeline, sample formats, hardware volume, and Songcast hooks.
+- [`docs/testing.md`](docs/testing.md) — Running the Rust unit/integration suites and Python `async_upnp_client` interop tests (`sh scripts/check.sh`).
 
 ## License
 
