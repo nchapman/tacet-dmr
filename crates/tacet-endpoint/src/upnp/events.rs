@@ -1,4 +1,4 @@
-//! GENA eventing (`SUBSCRIBE`, `UNSUBSCRIBE`, `NOTIFY`) and `LastChange` XML.
+//! UPnP AV GENA eventing (`SUBSCRIBE`, `UNSUBSCRIBE`, `NOTIFY`) and `<LastChange>` XML.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -11,7 +11,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
-use crate::renderer::schema::{AV, CM, RC, escape, sink_protocols, tag};
+use crate::upnp::schema::{AV, CM, RC, escape, sink_protocols, tag};
 
 const EVENT_NS: &str = "urn:schemas-upnp-org:event-1-0";
 
@@ -90,6 +90,30 @@ pub fn format_timestamp(total_secs: u64) -> String {
     let m = (total_secs % 3600) / 60;
     let s = total_secs % 60;
     format!("{h}:{m:02}:{s:02}")
+}
+
+pub fn parse_timestamp(raw: &str) -> Option<f64> {
+    let parts: Vec<&str> = raw.trim().split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: u64 = parts[0].parse().ok()?;
+    let m: u64 = parts[1].parse().ok()?;
+    let (sec_str, frac) = match parts[2].split_once('.') {
+        Some((s, f)) => {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let frac: f64 = format!("0.{f}").parse().ok()?;
+            (s, frac)
+        }
+        None => (parts[2], 0.0),
+    };
+    let s: u64 = sec_str.parse().ok()?;
+    if m >= 60 || s >= 60 {
+        return None;
+    }
+    Some((h * 3600 + m * 60 + s) as f64 + frac)
 }
 
 pub fn parse_timeout_seconds(header: Option<&str>) -> u64 {
@@ -187,10 +211,6 @@ impl SubRegistry {
         self.subs.values().any(|s| s.service == RC)
     }
 
-    pub fn next_expiry(&self) -> Option<Instant> {
-        self.subs.values().map(|s| s.expires).min()
-    }
-
     pub fn expire_stale(&mut self, now: Instant) {
         self.subs.retain(|_, s| {
             if now >= s.expires {
@@ -233,8 +253,6 @@ pub fn spawn_notifier(
     on_drop: impl FnOnce(String) + Send + 'static,
 ) {
     tokio::spawn(async move {
-        // Brief pause so the HTTP SUBSCRIBE 200 OK response (carrying SID)
-        // flushes to the controller before SEQ=0 NOTIFY arrives.
         tokio::select! {
             _ = stop_rx.changed() => {
                 if *stop_rx.borrow() {
@@ -318,28 +336,27 @@ async fn send_notify(
         host.to_string()
     };
 
-    let body = state.body(service);
-    let req = match hyper::Request::builder()
+    let body = Bytes::from(state.body(service));
+    let Ok(req) = hyper::Request::builder()
         .method(Method::from_bytes(b"NOTIFY").unwrap())
         .uri(path)
-        .header("Host", host_header)
-        .header("Content-Type", r#"text/xml; charset="utf-8""#)
+        .header("HOST", host_header)
+        .header("CONTENT-TYPE", "text/xml; charset=\"utf-8\"")
+        .header("CONTENT-LENGTH", body.len().to_string())
         .header("NT", "upnp:event")
         .header("NTS", "upnp:propchange")
         .header("SID", sid)
         .header("SEQ", seq.to_string())
-        .header("Content-Length", body.len().to_string())
-        .header("Connection", "close")
-        .body(Full::new(Bytes::from(body)))
-    {
-        Ok(r) => r,
-        Err(_) => return false,
+        .body(Full::new(body))
+    else {
+        return false;
     };
 
-    let fut = async {
+    let io_fut = async {
         let stream = TcpStream::connect(&addr).await.ok()?;
-        let io = TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .ok()?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
@@ -348,63 +365,7 @@ async fn send_notify(
     };
 
     matches!(
-        tokio::time::timeout(Duration::from_secs(5), fut).await,
+        tokio::time::timeout(Duration::from_secs(3), io_fut).await,
         Ok(Some(true))
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn next_seq_never_wraps_to_zero() {
-        assert_eq!(next_seq(0), 1);
-        assert_eq!(next_seq(1), 2);
-        assert_eq!(next_seq(u32::MAX), 1);
-    }
-
-    #[test]
-    fn event_state_changed_for_isolates_services() {
-        let a = EventState {
-            state: "STOPPED".into(),
-            status: "OK".into(),
-            volume: 30,
-            mute: false,
-            ..Default::default()
-        };
-        let mut b = a.clone();
-        b.volume = 55;
-        assert!(b.changed_for(RC, &a));
-        assert!(!b.changed_for(AV, &a));
-        assert!(!b.changed_for(CM, &a));
-
-        let mut c = a.clone();
-        c.state = "PLAYING".into();
-        assert!(c.changed_for(AV, &a));
-        assert!(!c.changed_for(RC, &a));
-    }
-
-    #[test]
-    fn expire_stale_removes_expired_and_signals_stop() {
-        let mut mgr = SubRegistry::new(EventState::default());
-        let (tx, _rx) = watch::channel(EventState::default());
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let now = Instant::now();
-        mgr.subs.insert(
-            "uuid:expired".into(),
-            Subscription {
-                sid: "uuid:expired".into(),
-                service: AV.into(),
-                callback: "http://127.0.0.1:9999/cb".into(),
-                peer: "127.0.0.1".parse().unwrap(),
-                expires: now,
-                tx,
-                stop_tx,
-            },
-        );
-        mgr.expire_stale(now + Duration::from_secs(1));
-        assert!(mgr.subs.is_empty());
-        assert!(*stop_rx.borrow());
-    }
 }

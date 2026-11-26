@@ -2,21 +2,20 @@
 
 ## Running the Suite
 
-Requires Rust 1.85+, `uv`, and Python ≥ 3.11 (for the black-box UPnP/LinkPlay interoperability suite). Python and the test clients are **not** runtime dependencies.
+Requires Rust 1.89+, `uv`, and Python ≥ 3.11 (for the black-box `async_upnp_client` interoperability suite). Python and the test clients are **not** runtime dependencies.
 
 ```sh
-# Clippy + Rust unit tests + 15-test Python UPnP/LinkPlay interop suite
+# Clippy + Rust unit/integration tests + Python OpenHome & UPnP AV interop suite
 sh scripts/check.sh
 
-# Include live SSDP multicast discovery + unmodified sibling ../tacet queue peer test
-TACET_DMR_TEST_SSDP=1 DMR_TEST_IP="$(ipconfig getifaddr en0)" sh scripts/check.sh
+# Include live multicast SSDP discovery verification
+TACET_ENDPOINT_TEST_SSDP=1 sh scripts/check.sh
 ```
 
 ## Coverage
 
 | Layer | Suite | What It Verifies |
 | --- | --- | --- |
-| Audio engine (`tacet-audio`) | `cargo test -p tacet-audio` | Bit-exact `S16`/`S24Packed`/`S32`/`F32` packing, DragonFly Black 24-bit-packed physical format selection, live read-only macOS CoreAudio HAL smoke test, null-sink playback lifecycle, and exact sample-count gapless PCM transitions. |
-| Renderer protocol (`tacet-dmr`) | `cargo test -p tacet-dmr` | All 6 LinkPlay `LoopMode` (`0..5`) / UPnP `PlayMode` mappings, shuffle permutation + repeat semantics, `QueueContext` validation, CIDR/IPv4-mapped controller allowlist, and GENA callback host validation. |
-| Black-box UPnP/LinkPlay | `interop/` (`unittest`) | All 4 services (`AVTransport`, `RenderingControl`, `ConnectionManager`, `PlayQueue`), SOAP fault codes, GENA `SUBSCRIBE`/`NOTIFY`/renewal, lookahead queue edits, volume safety, and optional multicast SSDP discovery. |
-| Real control point | `scripts/test-tacet.sh` | Unmodified sibling `../tacet` `TestTacetDMRQueuePeer` driving the compiled `tacet-dmr` binary over HTTP/SOAP/GENA. |
+| Audio engine (`tacet-audio`) | `cargo test -p tacet-audio` | Bit-exact `S16`/`S24Packed`/`S32`/`F32` packing, Songcast big-endian PCM ↔ Q31 conversion, `DriftResampler`, DragonFly Black 24-bit-packed physical format selection, live read-only macOS CoreAudio HAL smoke test, `PcmTap`, `open_pcm`, and exact sample-count gapless PCM transitions. |
+| Endpoint protocol (`tacet-endpoint`) | `cargo test -p tacet-endpoint` | End-to-end OpenHome control via `openhome-client` (`Product`, `Playlist` gapless multi-track playback, `Info`, `Time`, `Volume`, GENA events), live UDP **Songcast leader → follower** PCM delivery, minimal UPnP AV (`AVTransport`, `RenderingControl`, `ConnectionManager`, fault codes), cross-device shared volume & source arbitration, `ControllerFilter`, and `-no-upnp` / `-no-sender`. |
+| Black-box interop (`interop/`) | `uv run --project interop python -m unittest discover -s interop -v` | Independent Python `async_upnp_client` verification of both OpenHome Media and UPnP AV SCPDs, SOAP actions, SOAP fault codes, GENA `SUBSCRIBE`/`NOTIFY`/renewal, exclusive volume safety policy, and optional multicast SSDP discovery. |

@@ -7,7 +7,10 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
-use symphonia::core::codecs::audio::{AudioDecoder as SymphoniaAudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::audio::well_known;
+use symphonia::core::codecs::audio::{
+    AudioCodecId, AudioDecoder as SymphoniaAudioDecoder, AudioDecoderOptions,
+};
 use symphonia::core::codecs::registry::CodecRegistry;
 use symphonia::core::common::Tier;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -36,6 +39,33 @@ pub struct TrackInfo {
     pub spec: PcmSpec,
     pub duration_secs: Option<f64>,
     pub codec: String,
+    pub lossless: bool,
+}
+
+fn describe_codec(id: AudioCodecId) -> (String, bool) {
+    match id {
+        well_known::CODEC_ID_FLAC => ("FLAC".into(), true),
+        well_known::CODEC_ID_ALAC => ("ALAC".into(), true),
+        well_known::CODEC_ID_WAVPACK => ("WavPack".into(), true),
+        well_known::CODEC_ID_MONKEYS_AUDIO => ("APE".into(), true),
+        well_known::CODEC_ID_TTA => ("TTA".into(), true),
+        well_known::CODEC_ID_MP1 | well_known::CODEC_ID_MP2 | well_known::CODEC_ID_MP3 => {
+            ("MP3".into(), false)
+        }
+        well_known::CODEC_ID_AAC => ("AAC".into(), false),
+        well_known::CODEC_ID_VORBIS => ("Vorbis".into(), false),
+        well_known::CODEC_ID_OPUS => ("Opus".into(), false),
+        id if id >= well_known::CODEC_ID_PCM_S32LE
+            && id <= well_known::CODEC_ID_PCM_F64BE_PLANAR =>
+        {
+            ("PCM".into(), true)
+        }
+        well_known::CODEC_ID_PCM_ALAW | well_known::CODEC_ID_PCM_MULAW => ("PCM".into(), false),
+        id if id >= well_known::CODEC_ID_ADPCM_G722 && id <= well_known::CODEC_ID_ADPCM_IMA_QT => {
+            ("ADPCM".into(), false)
+        }
+        other => (other.to_string(), false),
+    }
 }
 
 /// Streaming decoder yielding chunks of interleaved Q31 `i32` PCM samples.
@@ -115,7 +145,7 @@ impl AudioDecoder {
             }
         });
 
-        let codec = format!("{:?}", params.codec);
+        let (codec, lossless) = describe_codec(params.codec);
 
         Ok(Self {
             format,
@@ -125,6 +155,7 @@ impl AudioDecoder {
                 spec: PcmSpec::new(sample_rate, channels, bits_per_sample),
                 duration_secs,
                 codec,
+                lossless,
             },
             sample_buf: Vec::new(),
             time_base_secs,

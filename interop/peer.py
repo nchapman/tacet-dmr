@@ -1,4 +1,4 @@
-"""A fresh loopback-only renderer and seekable HTTP audio source for each test."""
+"""A fresh loopback-only tacet-endpoint and seekable HTTP audio source for each test."""
 import asyncio
 import io
 import os
@@ -18,30 +18,43 @@ class PeerTest(unittest.IsolatedAsyncioTestCase):
     extra_args = ()
 
     async def asyncSetUp(self):
-        binary = os.environ.get('DMR_TEST_BIN')
+        binary = os.environ.get('TACET_ENDPOINT_BIN') or os.environ.get('DMR_TEST_BIN')
         if not binary:
-            self.fail('use scripts/check.sh or set DMR_TEST_BIN to a built renderer')
+            self.fail('use scripts/check.sh or set TACET_ENDPOINT_BIN to a built endpoint')
         env = os.environ.copy()
-        if lib := env.get('DMR_TEST_LIB'):
-            env['DYLD_FALLBACK_LIBRARY_PATH'] = lib
-        # No option to target another renderer. Even accidental CI environment
-        # overrides must never aim the mutation suite at someone's speakers.
         proc = await asyncio.create_subprocess_exec(
             binary, '-serve', '127.0.0.1:0', '-controller', '127.0.0.1', '-device', self.device,
             *([] if self.multicast else ['-no-ssdp']), *self.extra_args,
             stdout=asyncio.subprocess.PIPE, env=env)
         self.addAsyncCleanup(self.stop_process, proc)
+        self.openhome_location = None
+        self.upnp_location = None
+        self.songcast_uri = None
+        expect_upnp = '-no-upnp' not in self.extra_args and '--no-upnp' not in self.extra_args
         async with asyncio.timeout(8):
             while line := await proc.stdout.readline():
-                if line.startswith(b'TACET_RENDERER_URL='):
-                    self.location = line.decode().strip().split('=', 1)[1]
+                text = line.decode().strip()
+                if text.startswith('TACET_OPENHOME_URL='):
+                    self.openhome_location = text.split('=', 1)[1]
+                elif text.startswith('TACET_UPNP_URL='):
+                    self.upnp_location = text.split('=', 1)[1]
+                elif text.startswith('TACET_SONGCAST_URL='):
+                    self.songcast_uri = text.split('=', 1)[1]
+                if self.openhome_location and (not expect_upnp or self.upnp_location):
                     break
             else:
-                self.fail('renderer exited without a description URL')
-        self.assertEqual(urlsplit(self.location).hostname, '127.0.0.1')
+                self.fail('endpoint exited without printing startup URLs')
+        self.assertEqual(urlsplit(self.openhome_location).hostname, '127.0.0.1')
         session = ClientSession(timeout=ClientTimeout(total=4), trust_env=False)
         self.addAsyncCleanup(session.close)
-        self.cp = await ControlPoint.connect(self.location, OriginRequester(self.location, session))
+        self.oh = await ControlPoint.connect(
+            self.openhome_location, OriginRequester(self.openhome_location, session))
+        if self.upnp_location:
+            self.assertEqual(urlsplit(self.upnp_location).hostname, '127.0.0.1')
+            self.cp = await ControlPoint.connect(
+                self.upnp_location, OriginRequester(self.upnp_location, session))
+        else:
+            self.cp = None
 
     @staticmethod
     async def stop_process(proc):

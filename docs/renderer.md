@@ -1,33 +1,57 @@
-# tacet-dmr Renderer Reference
+# tacet-endpoint Reference
 
 ## CLI Flags
 
+Both single-dash (`-flag`) and double-dash (`--flag`) forms are supported.
+
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-serve ADDR` | *(none)* | Host UPnP/LinkPlay renderer on a LAN IPv4:port or interface:port (e.g. `en0:49152`, `192.168.1.10:49152`). |
-| `-controller CIDR` | *(required with `-serve`)* | Trusted controller IPv4 address or CIDR allowlist (comma-separated, e.g. `192.168.1.0/24`). |
-| `-name NAME` | `Tacet Renderer` | UPnP `friendlyName`. |
+| `-serve ADDR` | *(none)* | Bind endpoint HTTP server to a LAN IPv4:port or interface:port (e.g. `en0:49152`, `192.168.1.10:49152`). |
+| `-room ROOM` | value of `-name` | OpenHome `Product:1` room name. |
+| `-name NAME` | `Tacet Endpoint` | OpenHome device name (`friendlyName` on UPnP AV is `"<Name> (UPnP)"`). |
+| `-controller CIDR` | *(allow any LAN peer)* | Optional trusted controller IPv4 address or CIDR allowlist (comma-separated, e.g. `192.168.1.0/24`). Gates both OpenHome and UPnP AV. |
 | `-device ID` | `auto` | Output target: `auto`, `coreaudio/<uid>` (macOS), `alsa/<name>` (Linux), `wasapi/<id>` (Windows), `null`, or `pcm/<path>`. |
 | `-exclusive` | `false` | Request exclusive hardware output (macOS CoreAudio hog mode + physical format switching, Linux ALSA `hw:`, Windows WASAPI Exclusive). |
 | `-volume 0-100` | hardware level, else `30` (exclusive) / `100` (shared) | Initial volume level. |
-| `-uuid UUID` | derived from hostname | Stable UPnP UDN override. |
-| `-no-ssdp` | `false` | Disable UDP multicast SSDP announcements; use the printed `TACET_RENDERER_URL`. |
+| `-uuid UUID` | derived from hostname | Stable OpenHome UDN override (UPnP AV UDN is deterministically derived from it). |
+| `-no-ssdp` | `false` | Disable UDP multicast SSDP announcements; use the printed `TACET_OPENHOME_URL` / `TACET_UPNP_URL`. |
+| `-no-upnp` | `false` | Disable the UPnP AV / DLNA `MediaRenderer:1` compatibility device (run pure OpenHome). |
+| `-no-sender` | `false` | Disable the Songcast `Sender:1` multi-room transmitter. |
 | `-list-devices` | `false` | Print available output device IDs and exit. |
 | `-version` | `false` | Print version and exit. |
 
-## Audio Engine (`tacet-audio`)
+## Startup Markers
 
-- **Decoding**: Pure-Rust `symphonia` (FLAC, ALAC, WAV, AIFF, CAF, MP3, AAC, Vorbis, Ogg, MP4/M4A, WebM/Matroska) into left-aligned Q31 `i32` PCM with gapless trimming enabled.
-- **Bit-exact integer path**: At unity volume (`100`, unmuted) or when hardware volume is active, `S16`, `S24Packed` (3-byte LE), `S24In32Left`, `S24In32Right`, and `S32` samples pass from decoder to DMA buffer in the integer domain without floating-point conversion.
-- **Gapless transitions**:
-  - Same sample rate and channel count: Track B streams directly into the same lock-free `rtrb` ringbuffer with zero gap and zero device reopen; `TrackChanged` fires on the exact frame boundary.
-  - Different sample rate or channel count: Track A drains completely, then the output stream reconfigures hardware sample rate/format for Track B.
-- **Honest `GetProtocolInfo`**: Only containerized MIME types natively decoded by `tacet-audio` are advertised; unsupported codecs (e.g. raw `audio/L16`, Opus, DSF, WavPack, APE, WMA) are omitted so control points transcode automatically.
+When `-serve` starts, `tacet-endpoint` prints machine-readable lines to stdout:
 
-## UPnP / LinkPlay Services
+- `TACET_OPENHOME_URL=http://<ip>:<port>/description.xml`
+- `TACET_UPNP_URL=http://<ip>:<port>/upnp/description.xml` *(omitted with `-no-upnp`)*
+- `TACET_SONGCAST_URL=ohz://...` or `ohu://<ip>:<port>` *(omitted with `-no-sender`)*
 
-- `AVTransport:1` (`/AVTransport/control`, `/AVTransport/events`, `/AVTransport/scpd.xml`)
-- `RenderingControl:1` (`/RenderingControl/control`, `/RenderingControl/events`, `/RenderingControl/scpd.xml`)
-- `ConnectionManager:1` (`/ConnectionManager/control`, `/ConnectionManager/events`, `/ConnectionManager/scpd.xml`)
-- `PlayQueue:1` (`urn:schemas-wiimu-com:service:PlayQueue:1`, `/PlayQueue/control`, `/PlayQueue/scpd.xml` — no event endpoint, matching LinkPlay hardware)
-- Full `LoopMode` `0..5` ↔ `PlayMode` mapping (`REPEAT_ALL`, `REPEAT_ONE`, `SHUFFLE`, `SHUFFLE_NOREPEAT`, `NORMAL`, `SHUFFLE_REPEAT_ONE`).
+## Dual-Device Single-Port Architecture
+
+A single HTTP server and a single UDP multicast `:1900` SSDP socket serve both devices with distinct UDNs:
+
+### OpenHome Media (`urn:av-openhome-org:device:Source:1`)
+- Device XML: `/description.xml`
+- Services:
+  - `urn:av-openhome-org:service:Product:1` — sources: `Playlist`, `Songcast` (`Receiver`), and `UPnP AV` (`UpnpAv`, when enabled)
+  - `urn:av-openhome-org:service:Playlist:1` — device-side gapless playlist, repeat, shuffle
+  - `urn:av-openhome-org:service:Info:1` — live codec, sample rate, bit depth, bitrate, lossless flag, and DIDL metadata
+  - `urn:av-openhome-org:service:Time:1` — track count, duration, elapsed seconds
+  - `urn:av-openhome-org:service:Volume:1` — shared hardware/software volume and mute
+  - `urn:av-openhome-org:service:Receiver:1` — Songcast follower receiver (`ohz://` / `ohu://`)
+  - `urn:av-openhome-org:service:Sender:1` — Songcast leader transmitter tapping pre-gain Q31 PCM from `tacet-audio` *(unless `-no-sender`)*
+
+### UPnP AV / DLNA Compatibility (`urn:schemas-upnp-org:device:MediaRenderer:1`)
+- Device XML: `/upnp/description.xml`
+- Services:
+  - `AVTransport:1` (`/upnp/AVTransport/{control,events,scpd.xml}`) — single-track + `SetNextAVTransportURI` gapless playback, pause, stop, seek (`REL_TIME`)
+  - `RenderingControl:1` (`/upnp/RenderingControl/{control,events,scpd.xml}`) — shared volume/mute + `FactoryDefaults` preset
+  - `ConnectionManager:1` (`/upnp/ConnectionManager/{control,events,scpd.xml}`) — honest `GetProtocolInfo` sink MIME list
+
+## Source Arbitration & Shared Volume
+
+- Starting playback via UPnP `AVTransport.Play` automatically switches OpenHome `Product:1` to the `UPnP AV` source, stops any active OpenHome `Playlist` or Songcast `Receiver`, and marks `Sender:1` `Disabled`.
+- Starting OpenHome `Playlist.Play` or `Receiver.Play` automatically stops UPnP `AVTransport` (`STOPPED`) and restores OpenHome source ownership.
+- Volume and mute changes from either OpenHome `Volume:1` or UPnP `RenderingControl:1` drive the single `tacet-audio` engine and emit GENA updates on both devices.

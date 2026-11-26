@@ -1,14 +1,17 @@
 [package]
-name = "tacet-dmr"
+name = "tacet-endpoint"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "UPnP / LinkPlay audio renderer powered by tacet-audio"
+description = "OpenHome Media, Songcast, and UPnP/DLNA audiophile audio endpoint powered by tacet-audio"
 
 [dependencies]
 tacet-audio = { path = "../tacet-audio" }
+openhome-core = { git = "https://github.com/nchapman/openhome-rs" }
+openhome-server = { git = "https://github.com/nchapman/openhome-rs" }
+openhome-songcast = { git = "https://github.com/nchapman/openhome-rs" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }
@@ -18,7 +21,9 @@ socket2 = { version = "0.6", features = ["all"] }
 if-addrs = "0.15"
 quick-xml = "0.37"
 uuid = { version = "1", features = ["v4", "v5"] }
-rand = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+openhome-client = { git = "https://github.com/nchapman/openhome-rs" }

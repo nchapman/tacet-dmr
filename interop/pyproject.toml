@@ -1,5 +1,5 @@
 [project]
-name = "tacet-dmr-interop-tests"
+name = "tacet-endpoint-interop-tests"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = ["async-upnp-client>=0.42,<1", "aiohttp>=3.10,<4", "defusedxml>=0.7,<1"]

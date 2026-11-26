@@ -255,6 +255,163 @@ pub fn pack_planar_channel(
     needed
 }
 
+/// Unpack interleaved signed big-endian PCM bytes (16, 24, or 32 bit — e.g.
+/// OpenHome Songcast wire format) into left-aligned Q31 `i32` samples.
+///
+/// Preserves 16-, 24-, and 32-bit integer values losslessly without floating-point
+/// conversion.
+pub fn pcm_be_into_q31(bytes: &[u8], bit_depth: u8, out: &mut Vec<i32>) {
+    out.clear();
+    match bit_depth {
+        16 => {
+            out.reserve(bytes.len() / 2);
+            for c in bytes.as_chunks::<2>().0 {
+                let s = i16::from_be_bytes(*c) as i32;
+                out.push(s << 16);
+            }
+        }
+        24 => {
+            out.reserve(bytes.len() / 3);
+            for &[b0, b1, b2] in bytes.as_chunks::<3>().0 {
+                out.push(i32::from_be_bytes([b0, b1, b2, 0]));
+            }
+        }
+        32 => {
+            out.reserve(bytes.len() / 4);
+            for c in bytes.as_chunks::<4>().0 {
+                out.push(i32::from_be_bytes(*c));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pack interleaved left-aligned Q31 `i32` samples into signed big-endian PCM
+/// bytes (16, 24, or 32 bit — e.g. OpenHome Songcast wire format).
+pub fn q31_into_pcm_be(samples: &[i32], bit_depth: u8, out: &mut Vec<u8>) {
+    out.clear();
+    match bit_depth {
+        16 => {
+            out.reserve(samples.len() * 2);
+            for &s in samples {
+                let b = ((s >> 16) as i16).to_be_bytes();
+                out.extend_from_slice(&b);
+            }
+        }
+        24 => {
+            out.reserve(samples.len() * 3);
+            for &s in samples {
+                let b = s.to_be_bytes();
+                out.extend_from_slice(&b[0..3]);
+            }
+        }
+        32 => {
+            out.reserve(samples.len() * 4);
+            for &s in samples {
+                out.extend_from_slice(&s.to_be_bytes());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Lightweight linear interpolator for fine clock-drift compensation (in ppm)
+/// over interleaved Q31 `i32` PCM frames.
+///
+/// Only engaged when network stream clock skew exceeds a threshold (e.g.
+/// `|skew_ppm| >= 2.0`), preserving bit-exact integer pass-through otherwise.
+#[derive(Debug, Clone)]
+pub struct DriftResampler {
+    channels: usize,
+    step: f64,
+    phase: f64,
+    prev_frame: Vec<i32>,
+    has_prev: bool,
+}
+
+impl DriftResampler {
+    pub fn new(channels: u16) -> Self {
+        let ch = channels.max(1) as usize;
+        Self {
+            channels: ch,
+            step: 1.0,
+            phase: 0.0,
+            prev_frame: vec![0; ch],
+            has_prev: false,
+        }
+    }
+
+    /// Set rate adjustment in parts-per-million (clamped to ±2000 ppm).
+    /// Positive `ppm` consumes input slightly faster (shortening output slightly).
+    pub fn set_rate_adjust_ppm(&mut self, ppm: f64) {
+        let clamped = if ppm.is_finite() {
+            ppm.clamp(-2000.0, 2000.0)
+        } else {
+            0.0
+        };
+        self.step = 1.0 + clamped * 1e-6;
+    }
+
+    pub fn reset(&mut self) {
+        self.phase = 0.0;
+        self.prev_frame.fill(0);
+        self.has_prev = false;
+    }
+
+    /// Resample interleaved Q31 `input` into `out` (cleared first).
+    pub fn process(&mut self, input: &[i32], out: &mut Vec<i32>) {
+        out.clear();
+        let ch = self.channels;
+        let in_frames = input.len() / ch;
+        if in_frames == 0 {
+            return;
+        }
+        if !self.has_prev {
+            self.prev_frame.copy_from_slice(&input[..ch]);
+            self.has_prev = true;
+        }
+
+        let est_frames = ((in_frames as f64) / self.step).ceil() as usize + 2;
+        out.reserve(est_frames * ch);
+
+        // Index -1 refers to `self.prev_frame`; 0..in_frames refer to `input`.
+        while self.phase < in_frames as f64 {
+            let idx = self.phase.floor() as isize;
+            let frac = self.phase - idx as f64;
+            let next_idx = idx + 1;
+            let f0 = if idx < 0 {
+                &self.prev_frame[..]
+            } else {
+                let o = (idx as usize) * ch;
+                &input[o..o + ch]
+            };
+            let f1 = if next_idx < 0 {
+                &self.prev_frame[..]
+            } else if (next_idx as usize) < in_frames {
+                let o = (next_idx as usize) * ch;
+                &input[o..o + ch]
+            } else {
+                let o = (in_frames - 1) * ch;
+                &input[o..o + ch]
+            };
+            for c in 0..ch {
+                let a = f0[c] as f64;
+                let b = f1[c] as f64;
+                let v = (a + (b - a) * frac)
+                    .round()
+                    .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                out.push(v);
+            }
+            self.phase += self.step;
+        }
+
+        self.phase -= in_frames as f64;
+        let last_off = (in_frames - 1) * ch;
+        self.prev_frame
+            .copy_from_slice(&input[last_off..last_off + ch]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +524,55 @@ mod tests {
             assert!(g >= prev, "volume {v} gain {g} < prev {prev}");
             prev = g;
         }
+    }
+
+    #[test]
+    fn pcm_be_q31_roundtrip_16_24_32() {
+        // 16-bit big-endian
+        let raw16: Vec<u8> = [0x7FFFi16, -0x8000i16, 0x1234i16, -1i16]
+            .into_iter()
+            .flat_map(i16::to_be_bytes)
+            .collect();
+        let mut q31 = Vec::new();
+        pcm_be_into_q31(&raw16, 16, &mut q31);
+        assert_eq!(q31, vec![0x7FFF_0000, i32::MIN, 0x1234_0000, -0x10000]);
+        let mut back16 = Vec::new();
+        q31_into_pcm_be(&q31, 16, &mut back16);
+        assert_eq!(back16, raw16);
+
+        // 24-bit big-endian (+0x7FFFFF, -0x800000, +0x123456, -1)
+        let raw24: Vec<u8> = vec![
+            0x7F, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x12, 0x34, 0x56, 0xFF, 0xFF, 0xFF,
+        ];
+        pcm_be_into_q31(&raw24, 24, &mut q31);
+        assert_eq!(q31, vec![0x7FFF_FF00, i32::MIN, 0x1234_5600, -256]);
+        let mut back24 = Vec::new();
+        q31_into_pcm_be(&q31, 24, &mut back24);
+        assert_eq!(back24, raw24);
+
+        // 32-bit big-endian
+        let raw32: Vec<u8> = [i32::MAX, i32::MIN, 0x0102_0304, -42]
+            .into_iter()
+            .flat_map(i32::to_be_bytes)
+            .collect();
+        pcm_be_into_q31(&raw32, 32, &mut q31);
+        let mut back32 = Vec::new();
+        q31_into_pcm_be(&q31, 32, &mut back32);
+        assert_eq!(back32, raw32);
+    }
+
+    #[test]
+    fn drift_resampler_adjusts_frame_count() {
+        let mut r = DriftResampler::new(2);
+        r.set_rate_adjust_ppm(1000.0); // +1000 ppm -> ~1 fewer frame per 1000
+        let input: Vec<i32> = (0..2000).map(|i| i * 1000).collect(); // 1000 stereo frames
+        let mut out = Vec::new();
+        r.process(&input, &mut out);
+        assert_eq!(out.len() % 2, 0);
+        let out_frames = out.len() / 2;
+        assert!(
+            (998..=1000).contains(&out_frames),
+            "out_frames={out_frames}"
+        );
     }
 }

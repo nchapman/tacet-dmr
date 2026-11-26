@@ -1,20 +1,27 @@
-"""Independent control-point adapter. No renderer constants or action tables.
+"""Independent control-point adapter built on async_upnp_client.
 
-The underlying library builds typed actions from the target's SCPDs, including
-vendor additions that do not exist in generated UPnP AV v1 clients.
+Builds typed actions directly from the target device's SCPDs for both OpenHome
+Media and standard UPnP AV services.
 """
-import xml.etree.ElementTree as ET
-
 from urllib.parse import urlsplit
 
 from async_upnp_client.client import UpnpRequester
 from async_upnp_client.const import HttpResponse
 from async_upnp_client.client_factory import UpnpFactory
 
+# Standard UPnP AV service URNs
 AV = 'urn:schemas-upnp-org:service:AVTransport:1'
 RC = 'urn:schemas-upnp-org:service:RenderingControl:1'
 CM = 'urn:schemas-upnp-org:service:ConnectionManager:1'
-PQ = 'urn:schemas-wiimu-com:service:PlayQueue:1'
+
+# OpenHome Media service URNs
+OH_PRODUCT = 'urn:av-openhome-org:service:Product:1'
+OH_PLAYLIST = 'urn:av-openhome-org:service:Playlist:1'
+OH_INFO = 'urn:av-openhome-org:service:Info:1'
+OH_TIME = 'urn:av-openhome-org:service:Time:1'
+OH_VOLUME = 'urn:av-openhome-org:service:Volume:1'
+OH_RECEIVER = 'urn:av-openhome-org:service:Receiver:1'
+OH_SENDER = 'urn:av-openhome-org:service:Sender:1'
 
 
 class OriginRequester(UpnpRequester):
@@ -71,17 +78,3 @@ class ControlPoint:
             raise AssertionError(f'{action}: expected outputs {expected}, received {set(reply)}')
         self.exercised.add((urn, action))
         return reply
-
-
-def playlist(name, tracks):
-    """LinkPlay QueueContext; let each XML serializer escape its own layer."""
-    root = ET.Element('PlayList')
-    ET.SubElement(root, 'ListName').text = name
-    info = ET.SubElement(root, 'ListInfo')
-    ET.SubElement(info, 'TrackNumber').text = str(len(tracks))
-    entries = ET.SubElement(root, 'Tracks')
-    for number, (uri, metadata) in enumerate(tracks, 1):
-        entry = ET.SubElement(entries, f'Track{number}')
-        ET.SubElement(entry, 'URL').text = uri
-        ET.SubElement(entry, 'Metadata').text = metadata
-    return ET.tostring(root, encoding='unicode')

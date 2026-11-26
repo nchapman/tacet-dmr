@@ -2,12 +2,12 @@
 resolver = "2"
 members = [
     "crates/tacet-audio",
-    "crates/tacet-dmr",
+    "crates/tacet-endpoint",
 ]
 
 [workspace.package]
 version = "0.3.3"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/nchapman/tacet-dmr"
+repository = "https://github.com/nchapman/tacet-endpoint"
 rust-version = "1.89"

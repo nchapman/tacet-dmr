@@ -2,8 +2,8 @@
 .DS_Store
 /dist/
 /target/
-/tacet-dmr
-/tacet-dmr.exe
+/tacet-endpoint
+/tacet-endpoint.exe
 __pycache__/
 *.pyc
 .venv/

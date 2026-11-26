@@ -1,7 +1,6 @@
-//! `tacet-dmr` CLI entry point.
+//! `tacet-endpoint` CLI entry point.
 //!
-//! Accepts both single-dash (`-serve`) and double-dash (`--serve`) flags for
-//! drop-in compatibility with existing scripts, `interop/*.py`, and Tacet tests.
+//! Accepts both single-dash (`-serve`) and double-dash (`--serve`) flags.
 
 use std::io;
 use std::process::ExitCode;
@@ -9,12 +8,15 @@ use std::process::ExitCode;
 use tacet_audio::{
     EngineConfig, PlaybackEvent, Player, is_exclusive_target, list_devices, validate_target,
 };
-use tacet_dmr::{ServerConfig, serve};
+use tacet_endpoint::{EndpointConfig, serve};
 use tokio::sync::watch;
 
-const VERSION: &str = match option_env!("TACET_DMR_VERSION") {
+const VERSION: &str = match option_env!("TACET_ENDPOINT_VERSION") {
     Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
+    None => match option_env!("TACET_DMR_VERSION") {
+        Some(v) => v,
+        None => env!("CARGO_PKG_VERSION"),
+    },
 };
 
 #[derive(Default)]
@@ -25,17 +27,20 @@ struct CliArgs {
     exclusive: bool,
     volume: Option<u8>,
     serve: String,
-    controller: String,
+    controller: Option<String>,
+    room: Option<String>,
     name: String,
     uuid: String,
     no_ssdp: bool,
+    no_upnp: bool,
+    no_sender: bool,
     tracks: Vec<String>,
     help: bool,
 }
 
 fn parse_args(raw: &[String]) -> Result<CliArgs, String> {
     let mut out = CliArgs {
-        name: "Tacet Renderer".into(),
+        name: "Tacet Endpoint".into(),
         ..Default::default()
     };
     let mut i = 0;
@@ -67,9 +72,12 @@ fn parse_args(raw: &[String]) -> Result<CliArgs, String> {
             "list-devices" => out.list_devices = true,
             "exclusive" => out.exclusive = true,
             "no-ssdp" => out.no_ssdp = true,
+            "no-upnp" => out.no_upnp = true,
+            "no-sender" => out.no_sender = true,
             "device" => out.device = next_val(&mut i, inline_val, "device")?,
             "serve" => out.serve = next_val(&mut i, inline_val, "serve")?,
-            "controller" => out.controller = next_val(&mut i, inline_val, "controller")?,
+            "controller" => out.controller = Some(next_val(&mut i, inline_val, "controller")?),
+            "room" => out.room = Some(next_val(&mut i, inline_val, "room")?),
             "name" => out.name = next_val(&mut i, inline_val, "name")?,
             "uuid" => out.uuid = next_val(&mut i, inline_val, "uuid")?,
             "volume" => {
@@ -90,18 +98,21 @@ fn parse_args(raw: &[String]) -> Result<CliArgs, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: tacet-dmr [flags] FILE-OR-HTTP-URL ...\n\
-               tacet-dmr -serve LAN-IP-OR-IFACE:PORT -controller TACET-IP-OR-CIDR [flags]\n\
-               tacet-dmr -list-devices | -version\n\n\
+        "Usage: tacet-endpoint [flags] FILE-OR-HTTP-URL ...\n\
+               tacet-endpoint -serve LAN-IP-OR-IFACE:PORT [flags]\n\
+               tacet-endpoint -list-devices | -version\n\n\
          Flags:\n\
-           -serve ADDR        host a UPnP renderer on LAN IPv4:port or interface:port (e.g. en0:49152)\n\
-           -controller CIDR   trusted controller IPv4 or LAN CIDR (required with -serve)\n\
-           -name NAME         UPnP friendly name (default \"Tacet Renderer\")\n\
+           -serve ADDR        host OpenHome + UPnP/DLNA endpoint on IPv4:port or iface:port (e.g. en0:49152)\n\
+           -room NAME         OpenHome room name (default: value of -name)\n\
+           -name NAME         device friendly name (default \"Tacet Endpoint\")\n\
+           -controller CIDR   optional trusted controller IPv4 or LAN CIDR allowlist (comma-separated)\n\
            -device ID         output device ID (default \"auto\"; see -list-devices)\n\
            -exclusive         request exclusive hardware output (CoreAudio hog / ALSA hw / WASAPI exclusive)\n\
            -volume 0-100      initial volume\n\
-           -uuid UUID         override stable renderer UUID\n\
+           -uuid UUID         override stable OpenHome UUID\n\
            -no-ssdp           disable multicast SSDP discovery\n\
+           -no-upnp           disable basic UPnP/DLNA MediaRenderer:1 compatibility device\n\
+           -no-sender         disable OpenHome Songcast Sender:1 multi-room leader rebroadcast\n\
            -list-devices      list audio output device IDs and exit\n\
            -version           print version and exit"
     );
@@ -113,7 +124,7 @@ async fn main() -> ExitCode {
     let args = match parse_args(&raw) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("tacet-dmr: {e}");
+            eprintln!("tacet-endpoint: {e}");
             return ExitCode::from(1);
         }
     };
@@ -123,12 +134,12 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.version {
-        println!("tacet-dmr {VERSION}");
+        println!("tacet-endpoint {VERSION}");
         return ExitCode::SUCCESS;
     }
     if args.list_devices {
         if !args.serve.is_empty() || !args.tracks.is_empty() {
-            eprintln!("tacet-dmr: -list-devices cannot be combined with -serve or tracks");
+            eprintln!("tacet-endpoint: -list-devices cannot be combined with -serve or tracks");
             return ExitCode::from(1);
         }
         for d in list_devices() {
@@ -140,15 +151,19 @@ async fn main() -> ExitCode {
 
     if !args.serve.is_empty() {
         if !args.tracks.is_empty() {
-            eprintln!("tacet-dmr: -serve cannot be combined with local tracks");
+            eprintln!("tacet-endpoint: -serve cannot be combined with local tracks");
             return ExitCode::from(1);
         }
-        let cfg = ServerConfig {
+        let cfg = EndpointConfig {
             listen: args.serve,
             controller: args.controller,
+            room: args.room,
             name: args.name,
             uuid: args.uuid,
             no_ssdp: args.no_ssdp,
+            no_upnp: args.no_upnp,
+            no_sender: args.no_sender,
+            allow_local_files: false,
             audio_device: if args.device.is_empty() {
                 "auto".into()
             } else {
@@ -183,14 +198,22 @@ async fn main() -> ExitCode {
         });
         let mut stdout = io::stdout();
         if let Err(e) = serve(cfg, shutdown_rx, &mut stdout).await {
-            eprintln!("tacet-dmr: {e}");
+            eprintln!("tacet-endpoint: {e}");
             return ExitCode::from(1);
         }
         return ExitCode::SUCCESS;
     }
 
-    if !args.controller.is_empty() || !args.uuid.is_empty() || args.no_ssdp {
-        eprintln!("tacet-dmr: -controller, -uuid, and -no-ssdp require -serve");
+    if args.controller.is_some()
+        || args.room.is_some()
+        || !args.uuid.is_empty()
+        || args.no_ssdp
+        || args.no_upnp
+        || args.no_sender
+    {
+        eprintln!(
+            "tacet-endpoint: -controller, -room, -uuid, -no-ssdp, -no-upnp, and -no-sender require -serve"
+        );
         return ExitCode::from(1);
     }
     if args.tracks.is_empty() {
@@ -204,7 +227,7 @@ async fn main() -> ExitCode {
         args.device
     };
     if let Err(e) = validate_target(&device) {
-        eprintln!("tacet-dmr: {e}");
+        eprintln!("tacet-endpoint: {e}");
         return ExitCode::from(1);
     }
     let exclusive = is_exclusive_target(&device, args.exclusive);
@@ -215,21 +238,21 @@ async fn main() -> ExitCode {
     }) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("tacet-dmr: {e}");
+            eprintln!("tacet-endpoint: {e}");
             return ExitCode::from(1);
         }
     };
 
     for track in &args.tracks {
         if let Err(e) = player.open(track, false) {
-            eprintln!("tacet-dmr: {e}");
+            eprintln!("tacet-endpoint: {e}");
             return ExitCode::from(1);
         }
         while let Ok(ev) = rx.recv() {
             match ev {
                 PlaybackEvent::Ready { active, spec, .. } => {
                     eprintln!(
-                        "tacet-dmr: playing {} ({} Hz, {} ch, {}, exclusive={})",
+                        "tacet-endpoint: playing {} ({} Hz, {} ch, {}, exclusive={})",
                         active.device_name,
                         active.sample_rate,
                         spec.channels,
@@ -239,7 +262,7 @@ async fn main() -> ExitCode {
                 }
                 PlaybackEvent::TrackEnded { .. } => break,
                 PlaybackEvent::Error { message: e, .. } => {
-                    eprintln!("tacet-dmr: {e}");
+                    eprintln!("tacet-endpoint: {e}");
                     return ExitCode::from(1);
                 }
                 _ => {}

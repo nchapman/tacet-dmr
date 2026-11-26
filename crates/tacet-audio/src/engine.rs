@@ -45,6 +45,106 @@ impl Default for EngineConfig {
     }
 }
 
+/// Optional pre-gain PCM tap for rebroadcasting decoded playback audio
+/// (e.g. OpenHome Songcast `Sender:1`) before local volume scaling is applied.
+pub trait PcmTap: Send + Sync {
+    /// Return `true` only when downstream listeners are actively consuming audio.
+    /// When `false`, the decode worker skips packing/pacing overhead entirely.
+    fn is_active(&self) -> bool;
+
+    /// Receive a chunk of full-scale interleaved Q31 `i32` samples.
+    fn on_pcm(&self, spec: PcmSpec, info: &TrackInfo, samples: &[i32]);
+
+    /// Notify downstream listeners that playback paused, seeked, or stopped.
+    fn on_halt(&self);
+}
+
+type SharedOutputStream = Arc<Mutex<Option<Box<dyn OutputStream>>>>;
+
+/// Handle for pushing live interleaved Q31 `i32` PCM samples directly into the
+/// audio output sink (e.g. from an OpenHome Songcast `Receiver:1` stream).
+///
+/// Shares the player's exclusive output mode, hardware volume, and mute state.
+pub struct PcmStreamHandle {
+    spec: PcmSpec,
+    active: ActiveOutput,
+    producer: Producer<i32>,
+    shared: Arc<StreamShared>,
+    cancel: Arc<AtomicBool>,
+    stream: SharedOutputStream,
+}
+
+impl PcmStreamHandle {
+    pub fn spec(&self) -> PcmSpec {
+        self.spec
+    }
+
+    pub fn active_output(&self) -> &ActiveOutput {
+        &self.active
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire) || self.shared.is_stopped()
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.shared.is_failed()
+    }
+
+    /// Write interleaved Q31 `i32` samples to the output ringbuffer, blocking
+    /// briefly for backpressure while honoring cancellation or device failure.
+    pub fn write_q31(&mut self, samples: &[i32]) -> Result<(), String> {
+        let ch = self.spec.channels.max(1) as usize;
+        let aligned = (samples.len() / ch) * ch;
+        let mut off = 0;
+        while off < aligned {
+            if self.is_cancelled() {
+                return Err("stream cancelled".into());
+            }
+            if self.shared.is_failed() {
+                return Err("audio output device failed or disconnected".into());
+            }
+            let written = push_samples(&mut self.producer, &samples[off..aligned], ch);
+            if written == 0 {
+                thread::sleep(Duration::from_millis(2));
+            } else {
+                off += written;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write `frames` of silence into the output ringbuffer (e.g. Songcast pre-buffer).
+    pub fn write_silence_frames(&mut self, frames: usize) -> Result<(), String> {
+        let ch = self.spec.channels.max(1) as usize;
+        let total = frames.saturating_mul(ch);
+        if total == 0 {
+            return Ok(());
+        }
+        let zeros = vec![0i32; total.min(4096 * ch)];
+        let mut rem = total;
+        while rem > 0 {
+            let chunk = rem.min(zeros.len());
+            self.write_q31(&zeros[..chunk])?;
+            rem -= chunk;
+        }
+        Ok(())
+    }
+
+    /// Discard any buffered samples on the output sink immediately.
+    pub fn flush(&self) {
+        wait_for_flush(&self.shared, &self.cancel);
+    }
+}
+
+impl Drop for PcmStreamHandle {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.shared.stop.store(true, Ordering::Release);
+        let _ = self.stream.lock().unwrap().take();
+    }
+}
+
 /// Asynchronous playback lifecycle events emitted by [`Player`].
 #[derive(Debug, Clone)]
 pub enum PlaybackEvent {
@@ -54,6 +154,8 @@ pub enum PlaybackEvent {
         url: String,
         spec: PcmSpec,
         duration_secs: Option<f64>,
+        codec: String,
+        lossless: bool,
         active: ActiveOutput,
     },
     /// Playback seamlessly transitioned to the queued next track.
@@ -62,6 +164,8 @@ pub enum PlaybackEvent {
         url: String,
         spec: PcmSpec,
         duration_secs: Option<f64>,
+        codec: String,
+        lossless: bool,
         active: ActiveOutput,
     },
     /// Playback reached the end of the current track with no queued next track.
@@ -127,14 +231,20 @@ struct Session {
     id: u64,
     cancel: Arc<AtomicBool>,
     shared: Arc<StreamShared>,
-    cmd_tx: Sender<WorkerCmd>,
+    cmd_tx: Option<Sender<WorkerCmd>>,
     worker: Option<JoinHandle<()>>,
+    /// Direct PCM stream handle (used by `open_pcm` so `stop()` releases
+    /// exclusive hardware locks synchronously before the next stream opens).
+    pcm_stream: Option<SharedOutputStream>,
 }
 
 impl Session {
     fn stop(mut self) {
         self.cancel.store(true, Ordering::Release);
         self.shared.stop.store(true, Ordering::Release);
+        if let Some(stream_slot) = self.pcm_stream.take() {
+            let _ = stream_slot.lock().unwrap().take();
+        }
         if let Some(h) = self.worker.take() {
             // Fast path: wait up to 200 ms so normal playback releases exclusive
             // hardware locks synchronously before the next open(). If the worker
@@ -160,7 +270,7 @@ impl Session {
 /// Reusable audiophile audio player.
 ///
 /// Safe to share across threads (`Send + Sync`); suitable for both the
-/// standalone `tacet-dmr` daemon and embedding directly inside a Tauri app.
+/// standalone `tacet-endpoint` daemon and embedding directly inside a Tauri app.
 pub struct Player {
     cfg: EngineConfig,
     inner: Mutex<PlayerInner>,
@@ -176,6 +286,7 @@ struct PlayerInner {
     muted: bool,
     hw_vol: Option<Arc<dyn HardwareVolume>>,
     queued_next: Option<String>,
+    pcm_tap: Option<Arc<dyn PcmTap>>,
 }
 
 /// Apply current volume/mute state to hardware (when available) and return the
@@ -264,6 +375,7 @@ impl Player {
                 muted,
                 hw_vol,
                 queued_next: None,
+                pcm_tap: None,
             }),
             timing: Arc::new(Mutex::new(TimingState {
                 sample_rate: 0,
@@ -276,6 +388,17 @@ impl Player {
             event_tx: Mutex::new(Some(tx)),
         };
         Ok((player, rx))
+    }
+
+    /// Register or clear an optional pre-gain [`PcmTap`] (e.g. for Songcast `Sender:1`).
+    pub fn set_pcm_tap(&self, tap: Option<Arc<dyn PcmTap>>) {
+        self.inner.lock().unwrap().pcm_tap = tap;
+    }
+
+    /// Fast-path cached `(volume, muted)` without OS/FFI calls.
+    pub fn volume_state(&self) -> (u8, bool) {
+        let st = self.inner.lock().unwrap();
+        (st.volume, st.muted)
     }
 
     /// Current active session ID, or `0` if stopped.
@@ -315,7 +438,7 @@ impl Player {
             t.pending_transitions.clear();
         }
 
-        let (session_id, gain_q16) = {
+        let (session_id, gain_q16, pcm_tap) = {
             let mut st = self.inner.lock().unwrap();
             let id = st.next_session_id;
             st.next_session_id = st.next_session_id.wrapping_add(1).max(1);
@@ -325,7 +448,7 @@ impl Player {
                 st.hw_vol = sink::open_hardware_volume(&self.cfg.audio_device, exclusive);
             }
             let gain = apply_output_gain(&mut st);
-            (id, gain)
+            (id, gain, st.pcm_tap.clone())
         };
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -345,7 +468,7 @@ impl Player {
             .spawn(move || {
                 run_worker(
                     session_id, url_owned, target, exclusive, cancel_bg, shared_bg, timing_bg,
-                    cmd_rx, event_tx,
+                    cmd_rx, event_tx, pcm_tap,
                 );
             })
             .map_err(|e| format!("spawn audio worker: {e}"))?;
@@ -355,20 +478,96 @@ impl Player {
             id: session_id,
             cancel,
             shared,
-            cmd_tx,
+            cmd_tx: Some(cmd_tx),
             worker: Some(worker),
+            pcm_stream: None,
         });
         Ok(session_id)
+    }
+
+    /// Open a direct live PCM stream (for Songcast Receiver or other external
+    /// PCM sources) using the player's configured device, exclusive mode, and
+    /// hardware/software volume state. Cancels any active session first so
+    /// exclusive hardware locks are cleanly released.
+    pub fn open_pcm(&self, spec: PcmSpec) -> Result<(u64, PcmStreamHandle), String> {
+        let (prev, tap) = {
+            let mut st = self.inner.lock().unwrap();
+            st.queued_next = None;
+            st.paused = false;
+            (st.session.take(), st.pcm_tap.clone())
+        };
+        if let Some(s) = prev {
+            s.stop();
+        }
+        if let Some(t) = tap {
+            t.on_halt();
+        }
+
+        {
+            let mut t = self.timing.lock().unwrap();
+            t.sample_rate = spec.sample_rate;
+            t.base_frame = 0;
+            t.base_secs = 0.0;
+            t.duration_secs = 0.0;
+            t.active = None;
+            t.pending_transitions.clear();
+        }
+
+        let (session_id, gain_q16) = {
+            let mut st = self.inner.lock().unwrap();
+            let id = st.next_session_id;
+            st.next_session_id = st.next_session_id.wrapping_add(1).max(1);
+            let exclusive = sink::is_exclusive_target(&self.cfg.audio_device, self.cfg.exclusive);
+            if st.hw_vol.is_none() {
+                st.hw_vol = sink::open_hardware_volume(&self.cfg.audio_device, exclusive);
+            }
+            let gain = apply_output_gain(&mut st);
+            (id, gain)
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(StreamShared::new(false, gain_q16));
+        let (producer, consumer) = RingBuffer::<i32>::new(buffer_capacity_samples(spec));
+        let output = sink::open_stream(
+            &self.cfg.audio_device,
+            self.cfg.exclusive,
+            spec,
+            consumer,
+            Arc::clone(&shared),
+        )?;
+        let active = output.active_output().clone();
+        self.timing.lock().unwrap().active = Some(active.clone());
+
+        let stream_slot = Arc::new(Mutex::new(Some(output)));
+        let handle = PcmStreamHandle {
+            spec,
+            active,
+            producer,
+            shared: Arc::clone(&shared),
+            cancel: Arc::clone(&cancel),
+            stream: Arc::clone(&stream_slot),
+        };
+
+        let mut st = self.inner.lock().unwrap();
+        st.session = Some(Session {
+            id: session_id,
+            cancel,
+            shared,
+            cmd_tx: None,
+            worker: None,
+            pcm_stream: Some(stream_slot),
+        });
+        Ok((session_id, handle))
     }
 
     /// Queue a successor URL for gapless transition when the current track ends.
     pub fn queue_next(&self, url: &str) {
         let mut st = self.inner.lock().unwrap();
         st.queued_next = Some(url.to_string());
-        if let Some(sess) = &st.session {
-            let _ = sess
-                .cmd_tx
-                .send(WorkerCmd::QueueNext(Some(url.to_string())));
+        if let Some(sess) = &st.session
+            && let Some(tx) = &sess.cmd_tx
+        {
+            let _ = tx.send(WorkerCmd::QueueNext(Some(url.to_string())));
         }
     }
 
@@ -376,8 +575,10 @@ impl Player {
     pub fn clear_next(&self) {
         let mut st = self.inner.lock().unwrap();
         st.queued_next = None;
-        if let Some(sess) = &st.session {
-            let _ = sess.cmd_tx.send(WorkerCmd::QueueNext(None));
+        if let Some(sess) = &st.session
+            && let Some(tx) = &sess.cmd_tx
+        {
+            let _ = tx.send(WorkerCmd::QueueNext(None));
         }
     }
 
@@ -392,23 +593,32 @@ impl Player {
 
     /// Pause playback without releasing the output stream.
     pub fn pause(&self) {
-        let mut st = self.inner.lock().unwrap();
-        st.paused = true;
-        if let Some(sess) = &st.session {
-            sess.shared.paused.store(true, Ordering::Release);
+        let tap = {
+            let mut st = self.inner.lock().unwrap();
+            st.paused = true;
+            if let Some(sess) = &st.session {
+                sess.shared.paused.store(true, Ordering::Release);
+            }
+            st.pcm_tap.clone()
+        };
+        if let Some(t) = tap {
+            t.on_halt();
         }
     }
 
     /// Stop playback immediately and release the OS audio device (and hog lock).
     pub fn stop(&self) {
-        let prev = {
+        let (prev, tap) = {
             let mut st = self.inner.lock().unwrap();
             st.paused = false;
             st.queued_next = None;
-            st.session.take()
+            (st.session.take(), st.pcm_tap.clone())
         };
         if let Some(s) = prev {
             s.stop();
+        }
+        if let Some(t) = tap {
+            t.on_halt();
         }
         let mut t = self.timing.lock().unwrap();
         t.sample_rate = 0;
@@ -425,8 +635,10 @@ impl Player {
         let Some(sess) = &st.session else {
             return Err("not playing".into());
         };
-        sess.cmd_tx
-            .send(WorkerCmd::Seek(seconds.max(0.0)))
+        let Some(tx) = &sess.cmd_tx else {
+            return Err("stream is not seekable".into());
+        };
+        tx.send(WorkerCmd::Seek(seconds.max(0.0)))
             .map_err(|_| "audio worker stopped".to_string())
     }
 
@@ -584,6 +796,8 @@ fn advance_pending_transitions(
                     url: tr.url,
                     spec: tr.info.spec,
                     duration_secs: tr.info.duration_secs,
+                    codec: tr.info.codec,
+                    lossless: tr.info.lossless,
                     active: tr.active,
                 });
             } else {
@@ -607,6 +821,7 @@ fn run_worker(
     timing: Arc<Mutex<TimingState>>,
     cmd_rx: Receiver<WorkerCmd>,
     event_tx: Option<Sender<PlaybackEvent>>,
+    pcm_tap: Option<Arc<dyn PcmTap>>,
 ) {
     let mut decoder = match AudioDecoder::open(&initial_url, Arc::clone(&cancel)) {
         Ok(d) => d,
@@ -660,6 +875,8 @@ fn run_worker(
             url: initial_url,
             spec: cur_spec,
             duration_secs: decoder.info().duration_secs,
+            codec: decoder.info().codec.clone(),
+            lossless: decoder.info().lossless,
             active: active_info,
         },
     );
@@ -695,6 +912,9 @@ fn run_worker(
                         pending_samples.clear();
                         pending_offset = 0;
                         wait_for_flush(&shared, &cancel);
+                        if let Some(tap) = &pcm_tap {
+                            tap.on_halt();
+                        }
                         let cur_played = shared.frames_played();
                         frames_pushed = cur_played;
                         let mut t = timing.lock().unwrap();
@@ -709,10 +929,38 @@ fn run_worker(
         // Advance any gapless track boundaries that the hardware just crossed.
         advance_pending_transitions(session_id, shared.frames_played(), &timing, &event_tx);
 
+        // When a live PCM tap (e.g. Songcast Sender) has active listeners, keep
+        // ringbuffer lead modest (~100 ms) so rebroadcast packets stay aligned
+        // with real-time playback instead of bursting 1.5 s ahead.
+        let tap_active = pcm_tap.as_ref().is_some_and(|t| t.is_active());
+        if tap_active {
+            if shared.is_paused() {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let max_lead_frames = (cur_spec.sample_rate as u64 / 10).max(512);
+            let lead = frames_pushed.saturating_sub(shared.frames_played());
+            if lead >= max_lead_frames {
+                thread::sleep(Duration::from_millis(3));
+                continue;
+            }
+        }
+
         let ch = cur_spec.channels.max(1) as usize;
         // Push leftover samples from the previous decoded chunk first.
         if pending_offset < pending_samples.len() {
-            let written = push_samples(&mut producer, &pending_samples[pending_offset..], ch);
+            let prev_off = pending_offset;
+            let written = push_samples(&mut producer, &pending_samples[prev_off..], ch);
+            if written > 0
+                && tap_active
+                && let Some(tap) = &pcm_tap
+            {
+                tap.on_pcm(
+                    cur_spec,
+                    decoder.info(),
+                    &pending_samples[prev_off..prev_off + written],
+                );
+            }
             pending_offset += written;
             frames_pushed += (written / ch) as u64;
             if pending_offset < pending_samples.len() {
@@ -724,9 +972,16 @@ fn run_worker(
         }
 
         // Decode next audio chunk.
+        let cur_info = decoder.info().clone();
         match decoder.next_chunk() {
             Ok(Some(samples)) => {
                 let written = push_samples(&mut producer, samples, ch);
+                if written > 0
+                    && tap_active
+                    && let Some(tap) = &pcm_tap
+                {
+                    tap.on_pcm(cur_spec, &cur_info, &samples[..written]);
+                }
                 frames_pushed += (written / ch) as u64;
                 if written < samples.len() {
                     pending_samples.extend_from_slice(&samples[written..]);
@@ -858,6 +1113,8 @@ fn run_worker(
                                     url: next_url,
                                     spec: cur_spec,
                                     duration_secs: next_info.duration_secs,
+                                    codec: next_info.codec.clone(),
+                                    lossless: next_info.lossless,
                                     active,
                                 },
                             );
@@ -1026,6 +1283,8 @@ fn run_worker(
                                     url: next_url,
                                     spec: cur_spec,
                                     duration_secs: next_info.duration_secs,
+                                    codec: next_info.codec.clone(),
+                                    lossless: next_info.lossless,
                                     active,
                                 },
                             );
@@ -1083,6 +1342,9 @@ fn run_worker(
         }
     }
 
+    if let Some(tap) = &pcm_tap {
+        tap.on_halt();
+    }
     drop(stream);
 }
 
@@ -1268,6 +1530,7 @@ mod tests {
             muted: true,
             hw_vol: Some(Arc::new(VolOnlyHw)),
             queued_next: None,
+            pcm_tap: None,
         };
         // Changing volume while muted must keep software gain at 0.
         assert_eq!(apply_output_gain(&mut st), 0);
@@ -1467,5 +1730,98 @@ mod tests {
             (55, false)
         );
         assert_eq!(*explicit.writes.lock().unwrap(), vec![55]);
+    }
+
+    #[test]
+    fn pcm_tap_receives_unity_samples_and_halt() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountTap {
+            samples: AtomicUsize,
+            halts: AtomicUsize,
+        }
+        impl PcmTap for CountTap {
+            fn is_active(&self) -> bool {
+                true
+            }
+            fn on_pcm(&self, _spec: PcmSpec, _info: &TrackInfo, samples: &[i32]) {
+                self.samples.fetch_add(samples.len(), Ordering::Relaxed);
+            }
+            fn on_halt(&self) {
+                self.halts.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("tacet-audio-tap-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let wav = dir.join("tap.wav");
+        write_test_wav(&wav, 44_100, 4_410, 440.0); // 100 ms stereo = 8820 samples
+
+        let (player, rx) = Player::new(EngineConfig {
+            audio_device: "null".into(),
+            exclusive: false,
+            initial_volume: Some(50),
+        })
+        .unwrap();
+        let tap = Arc::new(CountTap {
+            samples: AtomicUsize::new(0),
+            halts: AtomicUsize::new(0),
+        });
+        player.set_pcm_tap(Some(Arc::clone(&tap) as Arc<dyn PcmTap>));
+        player.open(wav.to_str().unwrap(), false).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(PlaybackEvent::TrackEnded { .. }) = rx.recv_timeout(Duration::from_millis(50))
+            {
+                break;
+            }
+        }
+        assert_eq!(tap.samples.load(Ordering::Relaxed), 4_410 * 2);
+        assert!(tap.halts.load(Ordering::Relaxed) >= 1);
+        player.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_pcm_writes_to_file_sink_and_cancels_cleanly() {
+        let dir = std::env::temp_dir().join(format!("tacet-audio-pcm-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let out_raw = dir.join("out.raw");
+        let target = format!("pcm/{}", out_raw.display());
+
+        let (player, _rx) = Player::new(EngineConfig {
+            audio_device: target,
+            exclusive: false,
+            initial_volume: Some(100),
+        })
+        .unwrap();
+
+        let spec = PcmSpec::new(44_100, 2, 16);
+        let (sid, mut handle) = player.open_pcm(spec).unwrap();
+        assert!(sid > 0);
+        assert_eq!(handle.spec(), spec);
+
+        let samples = vec![0x1234_0000i32, -0x1234_0000i32, 0x2000_0000, -0x2000_0000];
+        handle.write_q31(&samples).unwrap();
+        handle.write_silence_frames(4).unwrap();
+        thread::sleep(Duration::from_millis(40));
+
+        // Stopping player cancels handle synchronously.
+        player.stop();
+        assert!(handle.is_cancelled());
+        assert!(handle.write_q31(&samples).is_err());
+
+        let bytes = fs::read(&out_raw).unwrap();
+        assert!(
+            bytes.len() >= 8,
+            "expected written PCM bytes, got {}",
+            bytes.len()
+        );
+        assert_eq!(i16::from_le_bytes([bytes[0], bytes[1]]), 0x1234);
+        assert_eq!(i16::from_le_bytes([bytes[2], bytes[3]]), -0x1234);
+
+        player.close();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -630,7 +630,7 @@ wheels = [
 ]
 
 [[package]]
-name = "tacet-dmr-interop-tests"
+name = "tacet-endpoint-interop-tests"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

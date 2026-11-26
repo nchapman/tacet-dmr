@@ -4,16 +4,18 @@ import xml.etree.ElementTree as ET
 
 from async_upnp_client.aiohttp import AiohttpNotifyServer
 
-from controlpoint import AV, CM, RC
+from controlpoint import AV, CM, OH_VOLUME, RC
 from peer import PeerTest
 
 
 class EventTests(PeerTest):
-    async def test_real_gena_callback_and_renewal(self):
+    async def test_upnp_and_openhome_gena_callbacks_and_renewal(self):
         server = AiohttpNotifyServer(self.cp.requester, ('127.0.0.1', 0))
         await server.async_start_server()
         self.addAsyncCleanup(server.async_stop_server)
         handler = server.event_handler
+
+        # UPnP AV services: CM, RC, AV
         for urn in (CM, RC, AV):
             with self.subTest(service=urn):
                 service = self.cp.device.service(urn)
@@ -47,3 +49,15 @@ class EventTests(PeerTest):
                     self.assertEqual(changed.find('.//{*}CurrentTrackURI').get('val'), uri)
                 await handler.async_unsubscribe(sid)
                 self.assertIsNone(handler.service_for_sid(sid))
+
+        # OpenHome Volume:1 GENA subscription via independent async_upnp_client
+        oh_vol = self.oh.device.service(OH_VOLUME)
+        oh_events = asyncio.Queue()
+        oh_vol.on_event = lambda _, changed: oh_events.put_nowait({v.name: v.value for v in changed})
+        sid, _ = await handler.async_subscribe(oh_vol, timedelta(seconds=60))
+        initial = await asyncio.wait_for(oh_events.get(), 3)
+        self.assertIn('Volume', initial)
+        await self.oh.call(OH_VOLUME, 'SetVolume', Value=55)
+        updated = await asyncio.wait_for(oh_events.get(), 3)
+        self.assertEqual(updated['Volume'], 55)
+        await handler.async_unsubscribe(sid)

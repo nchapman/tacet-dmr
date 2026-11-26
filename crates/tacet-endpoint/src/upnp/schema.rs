@@ -1,19 +1,20 @@
-//! UPnP / LinkPlay device description, SCPD schemas, SOAP envelopes, and XML escaping.
+//! Minimal UPnP AV `MediaRenderer:1` device description, SCPD schemas,
+//! SOAP envelopes, and honest `ProtocolInfo` matching `tacet-audio`.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 
 pub const DEVICE_TYPE: &str = "urn:schemas-upnp-org:device:MediaRenderer:1";
 pub const AV: &str = "AVTransport";
 pub const RC: &str = "RenderingControl";
 pub const CM: &str = "ConnectionManager";
-pub const PQ: &str = "PlayQueue";
 
-pub const SERVICES: &[&str] = &[AV, RC, CM, PQ];
+pub const SERVICES: &[&str] = &[AV, RC, CM];
 
 /// Containerized audio MIME types natively demuxed and decoded by `tacet-audio`
 /// (`symphonia` + `symphonia-opus` pure-Rust decoders). Unimplemented codecs
 /// (DSF, WavPack, APE, WMA, raw audio/L16) are intentionally omitted so control
-/// points like Tacet transcode them automatically rather than failing playback.
+/// points transcode them automatically rather than failing playback.
 pub const SINK_MIMES: &[&str] = &[
     "audio/flac",
     "audio/x-flac",
@@ -33,6 +34,8 @@ pub const SINK_MIMES: &[&str] = &[
     "audio/x-matroska",
 ];
 
+/// Comma-separated UPnP `ProtocolInfo` list shared by OpenHome `Playlist:1`
+/// and UPnP `ConnectionManager:1`.
 pub fn sink_protocols() -> String {
     SINK_MIMES
         .iter()
@@ -42,11 +45,7 @@ pub fn sink_protocols() -> String {
 }
 
 pub fn service_type(service: &str) -> String {
-    if service == PQ {
-        "urn:schemas-wiimu-com:service:PlayQueue:1".into()
-    } else {
-        format!("urn:schemas-upnp-org:service:{service}:1")
-    }
+    format!("urn:schemas-upnp-org:service:{service}:1")
 }
 
 /// Write XML-escaped text to `w` without intermediate allocations.
@@ -78,15 +77,6 @@ pub fn write_escaped<W: fmt::Write + ?Sized>(w: &mut W, s: &str) -> fmt::Result 
     Ok(())
 }
 
-/// Adapter that XML-escapes everything written through it into an inner `fmt::Write`.
-pub struct EscapeWriter<'a, W: fmt::Write + ?Sized>(pub &'a mut W);
-
-impl<W: fmt::Write + ?Sized> fmt::Write for EscapeWriter<'_, W> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        write_escaped(self.0, s)
-    }
-}
-
 pub fn write_tag<W: fmt::Write + ?Sized>(w: &mut W, name: &str, value: &str) -> fmt::Result {
     w.write_char('<')?;
     w.write_str(name)?;
@@ -109,33 +99,25 @@ pub fn tag(name: &str, value: &str) -> String {
     out
 }
 
+/// Render the UPnP `MediaRenderer:1` root device description served at `/upnp/description.xml`.
 pub fn device_xml(name: &str, udn: &str) -> String {
     let mut b = String::with_capacity(1024);
-    b.push_str(r#"<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><device>"#);
+    b.push_str(
+        r#"<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><device>"#,
+    );
     let _ = write_tag(&mut b, "deviceType", DEVICE_TYPE);
     let _ = write_tag(&mut b, "friendlyName", name);
     let _ = write_tag(&mut b, "manufacturer", "Tacet");
-    let _ = write_tag(&mut b, "modelName", "tacet-dmr");
+    let _ = write_tag(&mut b, "modelName", "tacet-endpoint");
     let _ = write_tag(&mut b, "UDN", udn);
     b.push_str("<serviceList>");
     for &s in SERVICES {
-        let (event_url, id) = if s == PQ {
-            (
-                String::new(),
-                "urn:wiimu-com:serviceId:PlayQueue".to_string(),
-            )
-        } else {
-            (
-                format!("/{s}/events"),
-                format!("urn:upnp-org:serviceId:{s}"),
-            )
-        };
         b.push_str("<service>");
         let _ = write_tag(&mut b, "serviceType", &service_type(s));
-        let _ = write_tag(&mut b, "serviceId", &id);
-        let _ = write_tag(&mut b, "SCPDURL", &format!("/{s}/scpd.xml"));
-        let _ = write_tag(&mut b, "controlURL", &format!("/{s}/control"));
-        let _ = write_tag(&mut b, "eventSubURL", &event_url);
+        let _ = write_tag(&mut b, "serviceId", &format!("urn:upnp-org:serviceId:{s}"));
+        let _ = write_tag(&mut b, "SCPDURL", &format!("/upnp/{s}/scpd.xml"));
+        let _ = write_tag(&mut b, "controlURL", &format!("/upnp/{s}/control"));
+        let _ = write_tag(&mut b, "eventSubURL", &format!("/upnp/{s}/events"));
         b.push_str("</service>");
     }
     b.push_str("</serviceList></device></root>");
@@ -155,6 +137,11 @@ pub fn actions_for(service: &str) -> &'static [ActionSpec] {
             ActionSpec {
                 name: "SetAVTransportURI",
                 inputs: "InstanceID:A_ARG_TYPE_InstanceID CurrentURI:AVTransportURI CurrentURIMetaData:AVTransportURIMetaData",
+                outputs: "",
+            },
+            ActionSpec {
+                name: "SetNextAVTransportURI",
+                inputs: "InstanceID:A_ARG_TYPE_InstanceID NextURI:NextAVTransportURI NextURIMetaData:NextAVTransportURIMetaData",
                 outputs: "",
             },
             ActionSpec {
@@ -178,29 +165,14 @@ pub fn actions_for(service: &str) -> &'static [ActionSpec] {
                 outputs: "",
             },
             ActionSpec {
-                name: "SetNextAVTransportURI",
-                inputs: "InstanceID:A_ARG_TYPE_InstanceID NextURI:NextAVTransportURI NextURIMetaData:NextAVTransportURIMetaData",
-                outputs: "",
-            },
-            ActionSpec {
-                name: "Next",
-                inputs: "InstanceID:A_ARG_TYPE_InstanceID",
-                outputs: "",
-            },
-            ActionSpec {
-                name: "Previous",
-                inputs: "InstanceID:A_ARG_TYPE_InstanceID",
+                name: "SetPlayMode",
+                inputs: "InstanceID:A_ARG_TYPE_InstanceID NewPlayMode:CurrentPlayMode",
                 outputs: "",
             },
             ActionSpec {
                 name: "GetCurrentTransportActions",
                 inputs: "InstanceID:A_ARG_TYPE_InstanceID",
                 outputs: "Actions:CurrentTransportActions",
-            },
-            ActionSpec {
-                name: "SetPlayMode",
-                inputs: "InstanceID:A_ARG_TYPE_InstanceID NewPlayMode:CurrentPlayMode",
-                outputs: "",
             },
             ActionSpec {
                 name: "GetTransportInfo",
@@ -226,53 +198,6 @@ pub fn actions_for(service: &str) -> &'static [ActionSpec] {
                 name: "GetTransportSettings",
                 inputs: "InstanceID:A_ARG_TYPE_InstanceID",
                 outputs: "PlayMode:CurrentPlayMode RecQualityMode:CurrentRecordQualityMode",
-            },
-        ],
-        PQ => &[
-            ActionSpec {
-                name: "BrowseQueue",
-                inputs: "QueueName:QueueName",
-                outputs: "QueueContext:QueueContext",
-            },
-            ActionSpec {
-                name: "GetQueueLoopMode",
-                inputs: "",
-                outputs: "LoopMode:LoopMode",
-            },
-            ActionSpec {
-                name: "CreateQueue",
-                inputs: "QueueContext:QueueContext",
-                outputs: "",
-            },
-            ActionSpec {
-                name: "AppendTracksInQueue",
-                inputs: "QueueContext:QueueContext",
-                outputs: "",
-            },
-            ActionSpec {
-                name: "PlayQueueWithIndex",
-                inputs: "QueueName:QueueName Index:Index",
-                outputs: "",
-            },
-            ActionSpec {
-                name: "GetQueueIndex",
-                inputs: "QueueName:QueueName",
-                outputs: "CurrentIndex:Index PreloadingIndex:Index CurrentPage:CurrentPage TrackNums:TrackNums",
-            },
-            ActionSpec {
-                name: "RemoveTracksInQueue",
-                inputs: "QueueName:QueueName RangStart:Index RangEnd:Index Action:QueueAction",
-                outputs: "",
-            },
-            ActionSpec {
-                name: "MoveTracksInQueue",
-                inputs: "QueueName:QueueName IndexList:IndexList ToIndex:Index",
-                outputs: "",
-            },
-            ActionSpec {
-                name: "SetQueueLoopMode",
-                inputs: "LoopMode:LoopMode",
-                outputs: "",
             },
         ],
         RC => &[
@@ -334,13 +259,7 @@ pub fn find_action(service: &str, name: &str) -> Option<&'static ActionSpec> {
 
 fn state_var_type(name: &str) -> &'static str {
     match name {
-        "Index"
-        | "CurrentPage"
-        | "TrackNums"
-        | "LoopMode"
-        | "A_ARG_TYPE_InstanceID"
-        | "CurrentTrack"
-        | "NumberOfTracks" => "ui4",
+        "A_ARG_TYPE_InstanceID" | "CurrentTrack" | "NumberOfTracks" => "ui4",
         "RelativeCounterPosition"
         | "AbsoluteCounterPosition"
         | "A_ARG_TYPE_RcsID"
@@ -355,7 +274,7 @@ fn state_var_type(name: &str) -> &'static str {
 pub fn scpd_xml(service: &str) -> String {
     let mut act_buf = String::new();
     let mut var_buf = String::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
 
     let mut add_var = |v: &str, send_events: bool| {
         if !seen.insert(v.to_string()) {
@@ -414,13 +333,13 @@ pub struct Fault {
 }
 
 impl Fault {
-    pub const INVALID_ARGS: Self = Self {
-        code: 402,
-        desc: "Invalid Args",
-    };
     pub const INVALID_ACTION: Self = Self {
         code: 401,
         desc: "Invalid Action",
+    };
+    pub const INVALID_ARGS: Self = Self {
+        code: 402,
+        desc: "Invalid Args",
     };
     pub const ACTION_FAILED: Self = Self {
         code: 501,
@@ -429,10 +348,6 @@ impl Fault {
     pub const TRANSITION_UNAVAILABLE: Self = Self {
         code: 701,
         desc: "Transition not available",
-    };
-    pub const INVALID_INSTANCE: Self = Self {
-        code: 718,
-        desc: "Invalid InstanceID",
     };
     pub const SEEK_MODE_UNSUPPORTED: Self = Self {
         code: 710,
@@ -446,9 +361,9 @@ impl Fault {
         code: 712,
         desc: "Play mode not supported",
     };
-    pub const QUEUE_CAPACITY: Self = Self {
-        code: 601,
-        desc: "Queue capacity exceeded",
+    pub const INVALID_INSTANCE: Self = Self {
+        code: 718,
+        desc: "Invalid InstanceID",
     };
 
     pub fn to_soap_xml(&self) -> String {
@@ -464,7 +379,7 @@ pub fn soap_response_xml(
     service: &str,
     action: &str,
     out_order: &str,
-    fields: &std::collections::HashMap<String, String>,
+    fields: &HashMap<String, String>,
 ) -> String {
     let mut b = String::with_capacity(512);
     let _ = write!(
