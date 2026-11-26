@@ -165,6 +165,16 @@ pub fn actions_for(service: &str) -> &'static [ActionSpec] {
                 outputs: "",
             },
             ActionSpec {
+                name: "Next",
+                inputs: "InstanceID:A_ARG_TYPE_InstanceID",
+                outputs: "",
+            },
+            ActionSpec {
+                name: "Previous",
+                inputs: "InstanceID:A_ARG_TYPE_InstanceID",
+                outputs: "",
+            },
+            ActionSpec {
                 name: "SetPlayMode",
                 inputs: "InstanceID:A_ARG_TYPE_InstanceID NewPlayMode:CurrentPlayMode",
                 outputs: "",

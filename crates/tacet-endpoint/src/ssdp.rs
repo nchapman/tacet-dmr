@@ -43,11 +43,16 @@ pub async fn run_ssdp(
     let host_header = mcast_dst.to_string();
 
     send_alive_all(&sock, mcast_dst, &host_header, &devices, &server_header).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    send_alive_all(&sock, mcast_dst, &host_header, &devices, &server_header).await;
 
     let mut tick = tokio::time::interval(Duration::from_secs(u64::from(MAX_AGE_SECS) / 3));
     tick.tick().await; // consume immediate tick
 
     let mut buf = [0u8; 4096];
+    let mut last_reply = tokio::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(tokio::time::Instant::now);
     loop {
         tokio::select! {
             res = shutdown_rx.changed() => {
@@ -59,37 +64,51 @@ pub async fn run_ssdp(
                 send_alive_all(&sock, mcast_dst, &host_header, &devices, &server_header).await;
             }
             recv = sock.recv_from(&mut buf) => {
-                if let Ok((len, peer)) = recv
-                    && let Ok(SsdpMessage::MSearch(search)) = decode_ssdp_packet(&buf[..len])
-                    && search.man.as_deref().is_some_and(|m| {
-                        m.split(';')
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .trim_matches('"')
-                            .eq_ignore_ascii_case("ssdp:discover")
-                    })
-                {
-                    for dev in &devices {
-                        for target in &dev.targets {
-                            if search_target_matches(&search.st, target) {
-                                let usn = format_usn(&dev.udn, target);
-                                let resp = encode_search_response(
-                                    &dev.location,
-                                    target,
-                                    &usn,
-                                    &server_header,
-                                    MAX_AGE_SECS,
-                                );
-                                let _ = sock.send_to(resp.as_bytes(), peer).await;
+                match recv {
+                    Ok((len, peer)) => {
+                        if let Ok(SsdpMessage::MSearch(search)) = decode_ssdp_packet(&buf[..len])
+                            && search.mx.is_some()
+                            && search.man.as_deref().is_some_and(|m| {
+                                m.split(';')
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .trim_matches('"')
+                                    .eq_ignore_ascii_case("ssdp:discover")
+                            })
+                        {
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(last_reply) < Duration::from_millis(20) {
+                                continue;
+                            }
+                            last_reply = now;
+                            for dev in &devices {
+                                for target in &dev.targets {
+                                    if search_target_matches(&search.st, target) {
+                                        let usn = format_usn(&dev.udn, target);
+                                        let resp = encode_search_response(
+                                            &dev.location,
+                                            target,
+                                            &usn,
+                                            &server_header,
+                                            MAX_AGE_SECS,
+                                        );
+                                        let _ = sock.send_to(resp.as_bytes(), peer).await;
+                                    }
+                                }
                             }
                         }
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
         }
     }
 
+    send_byebye_all(&sock, mcast_dst, &host_header, &devices).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     send_byebye_all(&sock, mcast_dst, &host_header, &devices).await;
     Ok(())
 }

@@ -335,6 +335,11 @@ impl CoordinatorState {
     /// Switch source index, returning `(changed, stopped_songcast_worker, needs_player_stop)`.
     fn switch_source_index(&mut self, idx: u32) -> (bool, Option<SongcastReceiverWorker>, bool) {
         if self.source_index == idx {
+            if self.standby {
+                self.standby = false;
+                self.sync_sender_flags();
+                return (true, None, false);
+            }
             return (false, None, false);
         }
         let mut stop_player = false;
@@ -656,6 +661,7 @@ impl EndpointCoordinator {
 
     /// Open the current OpenHome Playlist track on `tacet-audio` and queue the gapless next track.
     fn start_playlist_current_track(&self, paused: bool) {
+        let sid = self.player.reserve_session_id();
         let (entry, rx_worker) = {
             let mut st = self.state.lock().unwrap();
             let rx_worker = st.receiver_worker.take();
@@ -667,6 +673,7 @@ impl EndpointCoordinator {
             };
             if entry.is_some() {
                 st.owner = ActivePlaybackOwner::Playlist;
+                st.active_session_id = sid;
                 st.playlist_loaded_id = id;
                 st.playlist_queued_next_id = None;
                 st.transport_state = if paused {
@@ -699,16 +706,8 @@ impl EndpointCoordinator {
             tap.set_track(entry.uri.clone(), entry.metadata.clone());
         }
 
-        match self.player.open(&entry.uri, paused) {
-            Ok(sid) => {
-                {
-                    let mut st = self.state.lock().unwrap();
-                    if st.owner == ActivePlaybackOwner::Playlist
-                        && st.playlist_loaded_id == entry.id
-                    {
-                        st.active_session_id = sid;
-                    }
-                }
+        match self.player.open_with_id(sid, &entry.uri, paused) {
+            Ok(()) => {
                 self.sync_playlist_gapless_next();
             }
             Err(err) => {
@@ -716,11 +715,13 @@ impl EndpointCoordinator {
                     eprintln!("tacet-endpoint: open failed: {err}");
                 }
                 let mut st = self.state.lock().unwrap();
-                st.transport_state = TransportState::Stopped;
-                st.playlist_loaded_id = 0;
-                st.owner = ActivePlaybackOwner::None;
-                st.active_session_id = 0;
-                st.sync_sender_flags();
+                if st.active_session_id == sid {
+                    st.transport_state = TransportState::Stopped;
+                    st.playlist_loaded_id = 0;
+                    st.owner = ActivePlaybackOwner::None;
+                    st.active_session_id = 0;
+                    st.sync_sender_flags();
+                }
             }
         }
     }
@@ -1070,10 +1071,10 @@ impl EndpointCoordinator {
     }
 
     fn handle_songcast_event(&self, ev: SongcastEvent) {
-        let cur_gen = self.songcast_gen.load(Ordering::Acquire);
         let mut notify_oh: Vec<&'static str> = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
+            let cur_gen = self.songcast_gen.load(Ordering::Acquire);
             if st.owner != ActivePlaybackOwner::Receiver {
                 return;
             }
@@ -1575,6 +1576,9 @@ impl EndpointCoordinator {
                 out.insert("RecMedia".into(), "NOT_IMPLEMENTED".into());
                 out.insert("RecQualityModes".into(), "NOT_IMPLEMENTED".into());
             }
+            "Next" | "Previous" => {
+                return Err(UpnpFault::TRANSITION_UNAVAILABLE);
+            }
             "GetTransportSettings" => {
                 out.insert("PlayMode".into(), "NORMAL".into());
                 out.insert("RecQualityMode".into(), "NOT_IMPLEMENTED".into());
@@ -1586,29 +1590,29 @@ impl EndpointCoordinator {
     }
 
     fn open_upnp_current(&self, paused: bool) -> Result<(), UpnpFault> {
+        let sid = self.player.reserve_session_id();
         let (uri, next_uri) = {
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
+            if st.upnp_uri.is_empty() {
+                return Err(UpnpFault::TRANSITION_UNAVAILABLE);
+            }
+            st.owner = ActivePlaybackOwner::UpnpAv;
+            st.active_session_id = sid;
             (st.upnp_uri.clone(), st.upnp_next_uri.clone())
         };
-        if uri.is_empty() {
-            return Err(UpnpFault::TRANSITION_UNAVAILABLE);
-        }
-        let sid = self.player.open(&uri, paused).map_err(|err| {
+        self.player.open_with_id(sid, &uri, paused).map_err(|err| {
             if !self.quiet {
                 eprintln!("tacet-endpoint: [UPnP AV] open failed: {err}");
             }
             let mut st = self.state.lock().unwrap();
-            st.upnp_state = "STOPPED";
-            st.upnp_status = "ERROR_OCCURRED";
-            st.owner = ActivePlaybackOwner::None;
-            st.active_session_id = 0;
+            if st.active_session_id == sid {
+                st.upnp_state = "STOPPED";
+                st.upnp_status = "ERROR_OCCURRED";
+                st.owner = ActivePlaybackOwner::None;
+                st.active_session_id = 0;
+            }
             UpnpFault::ACTION_FAILED
         })?;
-        {
-            let mut st = self.state.lock().unwrap();
-            st.owner = ActivePlaybackOwner::UpnpAv;
-            st.active_session_id = sid;
-        }
         if !next_uri.is_empty() {
             self.player.queue_next(&next_uri);
         }
@@ -2044,32 +2048,41 @@ impl PlaylistService for EndpointCoordinator {
 
     fn seek_second_absolute(&self, seconds: u32) -> ActionResult<()> {
         {
-            let mut st = self.state.lock().unwrap();
+            let st = self.state.lock().unwrap();
             st.require_playlist_active()?;
+            if st.owner != ActivePlaybackOwner::Playlist || st.active_session_id == 0 {
+                return Err(OhFault::seek_failed());
+            }
             if st.time.duration > 0 && seconds > st.time.duration {
                 return Err(OhFault::seek_failed());
             }
-            st.time.seconds = seconds;
         }
-        let _ = self.player.seek(f64::from(seconds));
+        self.player
+            .seek(f64::from(seconds))
+            .map_err(|_| OhFault::seek_failed())?;
+        self.state.lock().unwrap().time.seconds = seconds;
         Ok(())
     }
 
     fn seek_second_relative(&self, delta_seconds: i32) -> ActionResult<()> {
         let target = {
-            let mut st = self.state.lock().unwrap();
+            let st = self.state.lock().unwrap();
             st.require_playlist_active()?;
+            if st.owner != ActivePlaybackOwner::Playlist || st.active_session_id == 0 {
+                return Err(OhFault::seek_failed());
+            }
             let cur = i64::from(st.time.seconds);
             let next = (cur + i64::from(delta_seconds)).max(0) as u32;
-            let clamped = if st.time.duration > 0 {
+            if st.time.duration > 0 {
                 next.min(st.time.duration)
             } else {
                 next
-            };
-            st.time.seconds = clamped;
-            clamped
+            }
         };
-        let _ = self.player.seek(f64::from(target));
+        self.player
+            .seek(f64::from(target))
+            .map_err(|_| OhFault::seek_failed())?;
+        self.state.lock().unwrap().time.seconds = target;
         Ok(())
     }
 
@@ -2252,22 +2265,41 @@ impl PlaylistService for EndpointCoordinator {
             st.id_array_token = st.id_array_token.wrapping_add(1);
             st.shuffle_order.retain(|&tid| tid != id);
             if st.current_id == id {
-                let was_playing = st.owner == ActivePlaybackOwner::Playlist
+                let playlist_active = st.is_source_type_active(&SourceType::Playlist);
+                let playlist_owned = st.owner == ActivePlaybackOwner::Playlist;
+                let was_playing = playlist_owned
                     && matches!(
                         st.transport_state,
                         TransportState::Playing | TransportState::Buffering
                     );
                 if st.tracks.is_empty() {
-                    st.clear_current_track();
+                    if playlist_active {
+                        st.clear_current_track();
+                    } else {
+                        st.current_id = 0;
+                    }
+                    st.playlist_loaded_id = 0;
+                    st.playlist_queued_next_id = None;
                     st.transport_state = TransportState::Stopped;
-                    DelAct::Stop
+                    st.sync_sender_flags();
+                    if playlist_owned {
+                        DelAct::Stop
+                    } else {
+                        DelAct::None
+                    }
                 } else {
                     let next_pos = pos.min(st.tracks.len() - 1);
-                    st.select_track_by_idx(next_pos);
+                    if playlist_active {
+                        st.select_track_by_idx(next_pos);
+                    } else {
+                        st.current_id = st.tracks[next_pos].id;
+                    }
                     if was_playing {
                         DelAct::LoadCurrent
-                    } else {
+                    } else if playlist_owned {
                         DelAct::Stop
+                    } else {
+                        DelAct::None
                     }
                 }
             } else {
@@ -2276,8 +2308,14 @@ impl PlaylistService for EndpointCoordinator {
         };
 
         match act {
-            DelAct::LoadCurrent => self.start_playlist_current_track(false),
-            DelAct::Stop => self.stop_active_playback(),
+            DelAct::LoadCurrent => {
+                self.start_playlist_current_track(false);
+                self.notify_openhome(&[SLUG_SENDER]);
+            }
+            DelAct::Stop => {
+                self.stop_active_playback();
+                self.notify_openhome(&[SLUG_SENDER]);
+            }
             DelAct::None => self.sync_playlist_gapless_next(),
         }
         Ok(())
@@ -2290,8 +2328,15 @@ impl PlaylistService for EndpointCoordinator {
             st.tracks.clear();
             st.shuffle_order.clear();
             st.total_track_bytes = 0;
-            st.clear_current_track();
+            if st.is_source_type_active(&SourceType::Playlist) {
+                st.clear_current_track();
+            } else {
+                st.current_id = 0;
+            }
+            st.playlist_loaded_id = 0;
+            st.playlist_queued_next_id = None;
             st.transport_state = TransportState::Stopped;
+            st.sync_sender_flags();
             if had_tracks {
                 st.id_array_token = st.id_array_token.wrapping_add(1);
             }
@@ -2299,6 +2344,7 @@ impl PlaylistService for EndpointCoordinator {
         };
         if stop_needed {
             self.stop_active_playback();
+            self.notify_openhome(&[SLUG_SENDER]);
         }
         Ok(())
     }

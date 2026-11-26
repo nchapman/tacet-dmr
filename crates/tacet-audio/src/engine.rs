@@ -68,6 +68,7 @@ type SharedOutputStream = Arc<Mutex<Option<Box<dyn OutputStream>>>>;
 pub struct PcmStreamHandle {
     spec: PcmSpec,
     active: ActiveOutput,
+    capacity_frames: usize,
     producer: Producer<i32>,
     shared: Arc<StreamShared>,
     cancel: Arc<AtomicBool>,
@@ -81,6 +82,23 @@ impl PcmStreamHandle {
 
     pub fn active_output(&self) -> &ActiveOutput {
         &self.active
+    }
+
+    /// Ringbuffer capacity in audio frames.
+    pub fn capacity_frames(&self) -> usize {
+        self.capacity_frames
+    }
+
+    /// Approximate number of frames currently buffered awaiting playback.
+    pub fn buffered_frames(&self) -> usize {
+        let ch = self.spec.channels.max(1) as usize;
+        let free_frames = self.producer.slots() / ch;
+        self.capacity_frames.saturating_sub(free_frames)
+    }
+
+    /// Total number of sink underrun callbacks observed on this stream.
+    pub fn underruns(&self) -> u64 {
+        self.shared.underruns.load(Ordering::Relaxed)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -273,6 +291,9 @@ impl Session {
 /// standalone `tacet-endpoint` daemon and embedding directly inside a Tauri app.
 pub struct Player {
     cfg: EngineConfig,
+    /// Serializes session lifecycle transitions (`open`, `open_pcm`, `stop`, `close`)
+    /// so exclusive hardware handles are always released before a new stream opens.
+    lifecycle: Mutex<()>,
     inner: Mutex<PlayerInner>,
     timing: Arc<Mutex<TimingState>>,
     event_tx: Mutex<Option<Sender<PlaybackEvent>>>,
@@ -367,6 +388,7 @@ impl Player {
 
         let player = Self {
             cfg,
+            lifecycle: Mutex::new(()),
             inner: Mutex::new(PlayerInner {
                 next_session_id: 1,
                 session: None,
@@ -412,11 +434,29 @@ impl Player {
             .unwrap_or(0)
     }
 
+    /// Reserve the next unique session ID before calling [`Self::open_with_id`].
+    /// Allows callers to record `active_session_id` before the worker thread
+    /// spawns so fast `Ready`/`Error` events can never race ahead of registration.
+    pub fn reserve_session_id(&self) -> u64 {
+        let mut st = self.inner.lock().unwrap();
+        let id = st.next_session_id;
+        st.next_session_id = st.next_session_id.wrapping_add(1).max(1);
+        id
+    }
+
     /// Open `url` (HTTP/HTTPS or local file) and begin playback (or start paused
     /// if `paused` is true). Cancels any active session cleanly before opening
     /// the new one so exclusive hardware locks are released first.
     pub fn open(&self, url: &str, paused: bool) -> Result<u64, String> {
-        // Stop any existing session outside the lock so worker join cannot deadlock.
+        let id = self.reserve_session_id();
+        self.open_with_id(id, url, paused)?;
+        Ok(id)
+    }
+
+    /// Open `url` using a pre-reserved `session_id` from [`Self::reserve_session_id`].
+    pub fn open_with_id(&self, session_id: u64, url: &str, paused: bool) -> Result<(), String> {
+        let _life = self.lifecycle.lock().unwrap();
+        // Stop any existing session outside `inner` so worker join cannot deadlock.
         let prev = {
             let mut st = self.inner.lock().unwrap();
             st.queued_next = None;
@@ -438,21 +478,20 @@ impl Player {
             t.pending_transitions.clear();
         }
 
-        let (session_id, gain_q16, pcm_tap) = {
+        let (gain_q16, pcm_tap) = {
             let mut st = self.inner.lock().unwrap();
-            let id = st.next_session_id;
-            st.next_session_id = st.next_session_id.wrapping_add(1).max(1);
             // Re-probe hardware volume on open in case a USB DAC was hotplugged.
             let exclusive = sink::is_exclusive_target(&self.cfg.audio_device, self.cfg.exclusive);
             if st.hw_vol.is_none() {
                 st.hw_vol = sink::open_hardware_volume(&self.cfg.audio_device, exclusive);
             }
             let gain = apply_output_gain(&mut st);
-            (id, gain, st.pcm_tap.clone())
+            (gain, st.pcm_tap.clone())
         };
 
         let cancel = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(StreamShared::new(paused, gain_q16));
+        let stream_slot: SharedOutputStream = Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::channel();
 
         let url_owned = url.to_string();
@@ -461,6 +500,7 @@ impl Player {
         let cancel_bg = Arc::clone(&cancel);
         let shared_bg = Arc::clone(&shared);
         let timing_bg = Arc::clone(&self.timing);
+        let stream_bg = Arc::clone(&stream_slot);
         let event_tx = self.event_tx.lock().unwrap().clone();
 
         let worker = thread::Builder::new()
@@ -468,7 +508,7 @@ impl Player {
             .spawn(move || {
                 run_worker(
                     session_id, url_owned, target, exclusive, cancel_bg, shared_bg, timing_bg,
-                    cmd_rx, event_tx, pcm_tap,
+                    stream_bg, cmd_rx, event_tx, pcm_tap,
                 );
             })
             .map_err(|e| format!("spawn audio worker: {e}"))?;
@@ -480,9 +520,9 @@ impl Player {
             shared,
             cmd_tx: Some(cmd_tx),
             worker: Some(worker),
-            pcm_stream: None,
+            pcm_stream: Some(stream_slot),
         });
-        Ok(session_id)
+        Ok(())
     }
 
     /// Open a direct live PCM stream (for Songcast Receiver or other external
@@ -490,6 +530,7 @@ impl Player {
     /// hardware/software volume state. Cancels any active session first so
     /// exclusive hardware locks are cleanly released.
     pub fn open_pcm(&self, spec: PcmSpec) -> Result<(u64, PcmStreamHandle), String> {
+        let _life = self.lifecycle.lock().unwrap();
         let (prev, tap) = {
             let mut st = self.inner.lock().unwrap();
             st.queued_next = None;
@@ -527,7 +568,9 @@ impl Player {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(StreamShared::new(false, gain_q16));
-        let (producer, consumer) = RingBuffer::<i32>::new(buffer_capacity_samples(spec));
+        let cap_samples = buffer_capacity_samples(spec);
+        let capacity_frames = cap_samples / spec.channels.max(1) as usize;
+        let (producer, consumer) = RingBuffer::<i32>::new(cap_samples);
         let output = sink::open_stream(
             &self.cfg.audio_device,
             self.cfg.exclusive,
@@ -542,6 +585,7 @@ impl Player {
         let handle = PcmStreamHandle {
             spec,
             active,
+            capacity_frames,
             producer,
             shared: Arc::clone(&shared),
             cancel: Arc::clone(&cancel),
@@ -608,6 +652,7 @@ impl Player {
 
     /// Stop playback immediately and release the OS audio device (and hog lock).
     pub fn stop(&self) {
+        let _life = self.lifecycle.lock().unwrap();
         let (prev, tap) = {
             let mut st = self.inner.lock().unwrap();
             st.paused = false;
@@ -819,6 +864,7 @@ fn run_worker(
     cancel: Arc<AtomicBool>,
     shared: Arc<StreamShared>,
     timing: Arc<Mutex<TimingState>>,
+    stream_slot: SharedOutputStream,
     cmd_rx: Receiver<WorkerCmd>,
     event_tx: Option<Sender<PlaybackEvent>>,
     pcm_tap: Option<Arc<dyn PcmTap>>,
@@ -842,7 +888,7 @@ fn run_worker(
     let mut cur_spec = decoder.info().spec;
     let (mut producer, consumer) = RingBuffer::<i32>::new(buffer_capacity_samples(cur_spec));
 
-    let mut stream: Box<dyn OutputStream> =
+    let initial_stream: Box<dyn OutputStream> =
         match sink::open_stream(&target, exclusive, cur_spec, consumer, Arc::clone(&shared)) {
             Ok(s) => s,
             Err(e) => {
@@ -859,14 +905,19 @@ fn run_worker(
             }
         };
 
-    let active_info = stream.active_output().clone();
+    let mut cur_active = initial_stream.active_output().clone();
+    if cancel.load(Ordering::Acquire) {
+        drop(initial_stream);
+        return;
+    }
+    *stream_slot.lock().unwrap() = Some(initial_stream);
     {
         let mut t = timing.lock().unwrap();
         t.sample_rate = cur_spec.sample_rate;
         t.base_frame = 0;
         t.base_secs = 0.0;
         t.duration_secs = decoder.info().duration_secs.unwrap_or(0.0);
-        t.active = Some(active_info.clone());
+        t.active = Some(cur_active.clone());
     }
     emit(
         &event_tx,
@@ -877,7 +928,7 @@ fn run_worker(
             duration_secs: decoder.info().duration_secs,
             codec: decoder.info().codec.clone(),
             lossless: decoder.info().lossless,
-            active: active_info,
+            active: cur_active.clone(),
         },
     );
 
@@ -947,10 +998,22 @@ fn run_worker(
         }
 
         let ch = cur_spec.channels.max(1) as usize;
+        // When a live PCM tap (Songcast Sender) is active, cap each push to ~5 ms
+        // so UDP packets are emitted at a steady cadence rather than bursting a
+        // full 90-370 ms decoded frame back-to-back.
+        let tap_step_samples = if tap_active {
+            ((cur_spec.sample_rate as usize / 200).max(64)) * ch
+        } else {
+            usize::MAX
+        };
+
         // Push leftover samples from the previous decoded chunk first.
         if pending_offset < pending_samples.len() {
             let prev_off = pending_offset;
-            let written = push_samples(&mut producer, &pending_samples[prev_off..], ch);
+            let end_off = pending_samples
+                .len()
+                .min(prev_off.saturating_add(tap_step_samples));
+            let written = push_samples(&mut producer, &pending_samples[prev_off..end_off], ch);
             if written > 0
                 && tap_active
                 && let Some(tap) = &pcm_tap
@@ -964,7 +1027,7 @@ fn run_worker(
             pending_offset += written;
             frames_pushed += (written / ch) as u64;
             if pending_offset < pending_samples.len() {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(if tap_active { 4 } else { 5 }));
                 continue;
             }
             pending_samples.clear();
@@ -975,7 +1038,8 @@ fn run_worker(
         let cur_info = decoder.info().clone();
         match decoder.next_chunk() {
             Ok(Some(samples)) => {
-                let written = push_samples(&mut producer, samples, ch);
+                let slice_end = samples.len().min(tap_step_samples);
+                let written = push_samples(&mut producer, &samples[..slice_end], ch);
                 if written > 0
                     && tap_active
                     && let Some(tap) = &pcm_tap
@@ -986,7 +1050,7 @@ fn run_worker(
                 if written < samples.len() {
                     pending_samples.extend_from_slice(&samples[written..]);
                     pending_offset = 0;
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(if tap_active { 4 } else { 5 }));
                 }
             }
             Ok(None) => {
@@ -999,6 +1063,9 @@ fn run_worker(
                         WorkerCmd::Seek(sec) => {
                             if let Ok(landed) = decoder.seek(sec) {
                                 wait_for_flush(&shared, &cancel);
+                                if let Some(tap) = &pcm_tap {
+                                    tap.on_halt();
+                                }
                                 let cur_played = shared.frames_played();
                                 frames_pushed = cur_played;
                                 let mut t = timing.lock().unwrap();
@@ -1015,10 +1082,12 @@ fn run_worker(
                     match AudioDecoder::open(&next_url, Arc::clone(&cancel)) {
                         Ok(next_dec) => {
                             let next_info = next_dec.info().clone();
-                            if next_info.spec.hardware_compatible(cur_spec) {
+                            let bit_depth_ok = cur_active.sample_format.bit_depth()
+                                >= next_info.spec.bits_per_sample;
+                            if next_info.spec.hardware_compatible(cur_spec) && bit_depth_ok {
                                 // True sample-accurate gapless transition on the same stream!
                                 let boundary = frames_pushed;
-                                let active = stream.active_output().clone();
+                                let active = cur_active.clone();
                                 {
                                     let mut t = timing.lock().unwrap();
                                     t.pending_transitions.push_back(PendingTransition {
@@ -1032,8 +1101,8 @@ fn run_worker(
                                 continue 'outer;
                             }
 
-                            // Sample rate or channel count changed: drain current track cleanly,
-                            // then reconfigure hardware for the new format.
+                            // Sample rate, channel count, or higher bit depth changed: drain
+                            // current track cleanly, then reconfigure hardware for the new format.
                             shared.draining.store(true, Ordering::Release);
                             while !shared.is_finished()
                                 && !shared.is_failed()
@@ -1063,7 +1132,7 @@ fn run_worker(
                             }
 
                             // Release old output stream before opening new rate/format.
-                            drop(stream);
+                            let _ = stream_slot.lock().unwrap().take();
                             shared.stop.store(false, Ordering::Release);
                             shared.draining.store(false, Ordering::Release);
                             shared.finished.store(false, Ordering::Release);
@@ -1075,7 +1144,7 @@ fn run_worker(
                             let (new_prod, new_cons) =
                                 RingBuffer::<i32>::new(buffer_capacity_samples(cur_spec));
                             producer = new_prod;
-                            stream = match sink::open_stream(
+                            let new_stream = match sink::open_stream(
                                 &target,
                                 exclusive,
                                 cur_spec,
@@ -1096,7 +1165,13 @@ fn run_worker(
                                     return;
                                 }
                             };
-                            let active = stream.active_output().clone();
+                            cur_active = new_stream.active_output().clone();
+                            if cancel.load(Ordering::Acquire) {
+                                drop(new_stream);
+                                return;
+                            }
+                            *stream_slot.lock().unwrap() = Some(new_stream);
+                            let active = cur_active.clone();
                             {
                                 let mut t = timing.lock().unwrap();
                                 t.sample_rate = cur_spec.sample_rate;
@@ -1155,11 +1230,13 @@ fn run_worker(
                                 if let Ok(next_dec) =
                                     AudioDecoder::open(&next_url, Arc::clone(&cancel))
                                     && next_dec.info().spec.hardware_compatible(cur_spec)
+                                    && cur_active.sample_format.bit_depth()
+                                        >= next_dec.info().spec.bits_per_sample
                                     && !shared.is_finished()
                                 {
                                     shared.draining.store(false, Ordering::Release);
                                     let boundary = frames_pushed;
-                                    let active = stream.active_output().clone();
+                                    let active = cur_active.clone();
                                     let mut t = timing.lock().unwrap();
                                     t.pending_transitions.push_back(PendingTransition {
                                         boundary_frame: boundary,
@@ -1184,6 +1261,9 @@ fn run_worker(
                                     shared.draining.store(false, Ordering::Release);
                                     shared.finished.store(false, Ordering::Release);
                                     wait_for_flush(&shared, &cancel);
+                                    if let Some(tap) = &pcm_tap {
+                                        tap.on_halt();
+                                    }
                                     let cur_played = shared.frames_played();
                                     frames_pushed = cur_played;
                                     let mut t = timing.lock().unwrap();
@@ -1216,11 +1296,13 @@ fn run_worker(
                     match AudioDecoder::open(&next_url, Arc::clone(&cancel)) {
                         Ok(next_dec) => {
                             let next_info = next_dec.info().clone();
-                            if next_info.spec.hardware_compatible(cur_spec) {
+                            let bit_depth_ok = cur_active.sample_format.bit_depth()
+                                >= next_info.spec.bits_per_sample;
+                            if next_info.spec.hardware_compatible(cur_spec) && bit_depth_ok {
                                 shared.draining.store(false, Ordering::Release);
                                 shared.finished.store(false, Ordering::Release);
                                 let boundary = frames_pushed;
-                                let active = stream.active_output().clone();
+                                let active = cur_active.clone();
                                 {
                                     let mut t = timing.lock().unwrap();
                                     t.pending_transitions.push_back(PendingTransition {
@@ -1233,7 +1315,7 @@ fn run_worker(
                                 decoder = next_dec;
                                 continue 'outer;
                             }
-                            drop(stream);
+                            let _ = stream_slot.lock().unwrap().take();
                             shared.stop.store(false, Ordering::Release);
                             shared.draining.store(false, Ordering::Release);
                             shared.finished.store(false, Ordering::Release);
@@ -1245,7 +1327,7 @@ fn run_worker(
                             let (new_prod, new_cons) =
                                 RingBuffer::<i32>::new(buffer_capacity_samples(cur_spec));
                             producer = new_prod;
-                            stream = match sink::open_stream(
+                            let new_stream = match sink::open_stream(
                                 &target,
                                 exclusive,
                                 cur_spec,
@@ -1266,7 +1348,13 @@ fn run_worker(
                                     return;
                                 }
                             };
-                            let active = stream.active_output().clone();
+                            cur_active = new_stream.active_output().clone();
+                            if cancel.load(Ordering::Acquire) {
+                                drop(new_stream);
+                                return;
+                            }
+                            *stream_slot.lock().unwrap() = Some(new_stream);
+                            let active = cur_active.clone();
                             {
                                 let mut t = timing.lock().unwrap();
                                 t.sample_rate = cur_spec.sample_rate;
@@ -1345,7 +1433,8 @@ fn run_worker(
     if let Some(tap) = &pcm_tap {
         tap.on_halt();
     }
-    drop(stream);
+    // Ensure the output stream is released cleanly on worker exit.
+    let _ = stream_slot.lock().unwrap().take();
 }
 
 fn push_samples(producer: &mut Producer<i32>, samples: &[i32], channels: usize) -> usize {

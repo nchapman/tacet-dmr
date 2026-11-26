@@ -867,3 +867,103 @@ fn config_and_filter_helpers() {
     assert_eq!(parse_timestamp("0:01:02.500"), Some(62.5));
     assert_eq!(parse_timestamp("0:60:00"), None);
 }
+
+#[tokio::test]
+async fn regression_empty_controller_fails_closed_and_source_isolation() {
+    // Empty -controller "" must fail closed, not silently allow all peers.
+    let err = RunningEndpoint::start(EndpointConfig {
+        listen: "127.0.0.1:0".into(),
+        controller: Some(String::new()),
+        no_ssdp: true,
+        no_sender: true,
+        audio_device: "null".into(),
+        quiet: true,
+        ..EndpointConfig::default()
+    })
+    .await;
+    assert!(err.is_err(), "empty -controller must fail closed");
+
+    let wav = build_wav_bytes(44_100, 44_100 * 2, 440.0);
+    let (base_url, srv) = spawn_wav_server(wav, Vec::new()).await;
+    let endpoint = RunningEndpoint::start(EndpointConfig {
+        listen: "127.0.0.1:0".into(),
+        name: "Regression Test".into(),
+        no_ssdp: true,
+        no_sender: true,
+        audio_device: "null".into(),
+        quiet: true,
+        ..EndpointConfig::default()
+    })
+    .await
+    .unwrap();
+    let addr = endpoint.local_addr();
+    let dev = OpenHomeDevice::connect(endpoint.openhome_url())
+        .await
+        .unwrap();
+    let prod = dev.product().unwrap();
+    let pl = dev.playlist().unwrap();
+
+    // SeekSecondAbsolute while Stopped must fail with SOAP fault (804).
+    assert!(pl.seek_second_absolute(5).await.is_err());
+
+    // SetSourceIndex on current index wakes from Standby.
+    prod.set_standby(true).await.unwrap();
+    assert!(prod.standby().await.unwrap());
+    prod.set_source_index(0).await.unwrap();
+    assert!(!prod.standby().await.unwrap());
+
+    // Playlist DeleteId / DeleteAll while UPnP AV is playing must NOT stop UPnP playback.
+    let uri = format!("{base_url}/a.wav");
+    let id1 = pl.insert(0, &uri, "").await.unwrap();
+    let (st, _) = upnp_soap(
+        addr,
+        "AVTransport",
+        "SetAVTransportURI",
+        &[
+            ("InstanceID", "0"),
+            ("CurrentURI", &uri),
+            ("CurrentURIMetaData", ""),
+        ],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = upnp_soap(
+        addr,
+        "AVTransport",
+        "Play",
+        &[("InstanceID", "0"), ("Speed", "1")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let (_, ti) = upnp_soap(
+            addr,
+            "AVTransport",
+            "GetTransportInfo",
+            &[("InstanceID", "0")],
+        )
+        .await;
+        if extract_tag(&ti, "CurrentTransportState").as_deref() == Some("PLAYING") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    pl.delete_id(id1).await.unwrap();
+    pl.delete_all().await.unwrap();
+    let (_, ti) = upnp_soap(
+        addr,
+        "AVTransport",
+        "GetTransportInfo",
+        &[("InstanceID", "0")],
+    )
+    .await;
+    assert_eq!(
+        extract_tag(&ti, "CurrentTransportState").as_deref(),
+        Some("PLAYING")
+    );
+
+    endpoint.shutdown().await;
+    srv.abort();
+}

@@ -50,11 +50,18 @@ impl EventState {
             }
             _ => {
                 let dur = format_timestamp(self.duration_sec);
+                let actions = match self.state.as_str() {
+                    "PLAYING" => "Stop,Pause,Seek",
+                    "PAUSED_PLAYBACK" => "Play,Stop,Seek",
+                    "STOPPED" if !self.uri.is_empty() => "Play,Stop",
+                    _ => "",
+                };
+                let uri_esc = escape(&self.uri);
                 let inner = format!(
-                    r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="{}"/><TransportStatus val="{}"/><CurrentTrackURI val="{}"/><CurrentTrackDuration val="{dur}"/><CurrentTrack val="{}"/><CurrentPlayMode val="{}"/><NextAVTransportURI val="{}"/></InstanceID></Event>"#,
+                    r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="{}"/><TransportStatus val="{}"/><AVTransportURI val="{uri_esc}"/><CurrentTrackURI val="{uri_esc}"/><CurrentTrackDuration val="{dur}"/><CurrentTrack val="{}"/><NumberOfTracks val="{}"/><CurrentPlayMode val="{}"/><CurrentTransportActions val="{actions}"/><NextAVTransportURI val="{}"/></InstanceID></Event>"#,
                     self.state,
                     self.status,
-                    escape(&self.uri),
+                    self.track,
                     self.track,
                     self.mode,
                     escape(&self.next)
@@ -156,7 +163,10 @@ pub fn parse_callback_url(raw: &str, peer: IpAddr) -> Option<String> {
             Ok(u) => u,
             Err(_) => continue,
         };
-        if uri.scheme_str() != Some("http") {
+        if !uri
+            .scheme_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("http"))
+        {
             continue;
         }
         let Some(host) = uri.host() else {

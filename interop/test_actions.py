@@ -129,6 +129,11 @@ class ActionTests(PeerTest):
         await self.av('Stop')
         self.assertEqual((await self.av('GetTransportInfo'))['CurrentTransportState'], 'STOPPED')
         self.assertIn('Play', (await self.av('GetCurrentTransportActions'))['Actions'].split(','))
+        for unsupported in ('Next', 'Previous'):
+            with self.assertRaises(UpnpActionResponseError) as caught:
+                await self.av(unsupported)
+            self.assertEqual((caught.exception.status, caught.exception.error_code), (500, 701))
+            self.cp.exercised.add((AV, unsupported))
         self.covered(self.cp, AV)
 
     async def test_soap_fault_codes(self):

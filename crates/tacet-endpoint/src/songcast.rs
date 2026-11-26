@@ -21,11 +21,20 @@ use tokio::sync::mpsc as tokio_mpsc;
 /// to align the first audio sample with the sender's scheduled `playout_at`.
 const MAX_SONGCAST_PREBUFFER: Duration = Duration::from_millis(250);
 
+enum TapCmd {
+    Audio { fmt: AudioFormat, payload: Vec<u8> },
+    Halt { fmt: AudioFormat },
+    SetTrack { uri: String, metadata: String },
+}
+
 /// Pre-gain [`PcmTap`] that rebroadcasts decoded `tacet-audio` Q31 PCM over a
 /// [`SongcastSender`] before local volume scaling is applied.
+///
+/// All `Audio`, `Halt`, and `SetTrack` commands flow through a single ordered
+/// channel so `HALT` and track metadata never reorder against audio packets.
 pub struct SongcastTap {
     sender: Arc<SongcastSender>,
-    runtime: tokio::runtime::Handle,
+    cmd_tx: tokio_mpsc::UnboundedSender<TapCmd>,
     enabled: AtomicBool,
     state: Mutex<TapState>,
 }
@@ -36,9 +45,26 @@ struct TapState {
 
 impl SongcastTap {
     pub fn new(sender: Arc<SongcastSender>, runtime: tokio::runtime::Handle) -> Self {
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<TapCmd>();
+        let sender_bg = Arc::clone(&sender);
+        runtime.spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    TapCmd::Audio { fmt, payload } => {
+                        let _ = sender_bg.send_audio(&fmt, payload, false).await;
+                    }
+                    TapCmd::Halt { fmt } => {
+                        let _ = sender_bg.send_audio(&fmt, Vec::new(), true).await;
+                    }
+                    TapCmd::SetTrack { uri, metadata } => {
+                        let _ = sender_bg.set_track(uri, metadata).await;
+                    }
+                }
+            }
+        });
         Self {
             sender,
-            runtime,
+            cmd_tx,
             enabled: AtomicBool::new(true),
             state: Mutex::new(TapState { last_fmt: None }),
         }
@@ -54,10 +80,7 @@ impl SongcastTap {
 
     /// Broadcast updated track URI and DIDL-Lite metadata to connected Songcast followers.
     pub fn set_track(&self, uri: String, metadata: String) {
-        let sender = Arc::clone(&self.sender);
-        self.runtime.spawn(async move {
-            let _ = sender.set_track(uri, metadata).await;
-        });
+        let _ = self.cmd_tx.send(TapCmd::SetTrack { uri, metadata });
     }
 }
 
@@ -71,8 +94,8 @@ impl PcmTap for SongcastTap {
             return;
         }
         let channels = (spec.channels as u8).max(1);
-        // Preserve 24-bit PCM for hi-res sources (matching ohPipeline's 24-bit Songcast cap).
-        let bit_depth: u8 = if spec.bits_per_sample >= 24 { 24 } else { 16 };
+        // Preserve 24-bit PCM for >16-bit sources (20/24/32-bit, matching ohPipeline's 24-bit cap).
+        let bit_depth: u8 = if spec.bits_per_sample > 16 { 24 } else { 16 };
         let dur_secs = info.duration_secs.unwrap_or(0.0).max(0.0);
         let fmt = AudioFormat {
             sample_rate: spec.sample_rate,
@@ -96,15 +119,14 @@ impl PcmTap for SongcastTap {
             let mut st = self.state.lock().unwrap();
             st.last_fmt = Some(fmt.clone());
         }
-        // Encode and send outside `self.state` so concurrent `on_halt`/`set_enabled`
-        // never block on network sends.
         for chunk in samples.chunks(samples_per_pkt) {
             let mut payload = Vec::with_capacity(chunk.len() * usize::from(bit_depth / 8));
             q31_into_pcm_be(chunk, bit_depth, &mut payload);
             if !payload.is_empty() {
-                let _ = self
-                    .runtime
-                    .block_on(self.sender.send_audio(&fmt, payload, false));
+                let _ = self.cmd_tx.send(TapCmd::Audio {
+                    fmt: fmt.clone(),
+                    payload,
+                });
             }
         }
     }
@@ -114,10 +136,7 @@ impl PcmTap for SongcastTap {
         if let Some(fmt) = last
             && self.sender.active_receivers() > 0
         {
-            let sender = Arc::clone(&self.sender);
-            self.runtime.spawn(async move {
-                let _ = sender.send_audio(&fmt, Vec::new(), true).await;
-            });
+            let _ = self.cmd_tx.send(TapCmd::Halt { fmt });
         }
     }
 }
@@ -246,6 +265,8 @@ fn receiver_loop(
     let mut playing = false;
     let mut prebuffered = false;
     let mut drift_resampler: Option<DriftResampler> = None;
+    let mut pi_integral: f64 = 0.0;
+    let mut last_underruns: u64 = 0;
     let mut q31_buf: Vec<i32> = Vec::with_capacity(8192);
     let mut drift_buf: Vec<i32> = Vec::new();
     let mut last_reported_sec: u32 = u32::MAX;
@@ -300,13 +321,21 @@ fn receiver_loop(
                     u16::from(frame.channels.max(1)),
                     u16::from(frame.bit_depth.max(16)),
                 );
-                if !last_spec.is_some_and(|s| s.hardware_compatible(spec)) {
+                let bit_depth_ok = stream.as_ref().is_some_and(|s| {
+                    s.active_output().sample_format.bit_depth() >= spec.bits_per_sample
+                });
+                if !last_spec.is_some_and(|s| s.hardware_compatible(spec)) || !bit_depth_ok {
+                    if cancel.load(Ordering::Acquire) {
+                        break;
+                    }
                     // Drop old stream BEFORE opening new one to avoid EBUSY on exclusive DACs.
                     stream = None;
                     prebuffered = false;
                     drift_resampler = None;
+                    pi_integral = 0.0;
                     match player.open_pcm(spec) {
                         Ok((_, handle)) => {
+                            last_underruns = handle.underruns();
                             stream = Some(handle);
                             last_spec = Some(spec);
                         }
@@ -383,20 +412,50 @@ fn receiver_loop(
                 }
 
                 pcm_be_into_q31(&frame.audio, frame.bit_depth, &mut q31_buf);
-                if !q31_buf.is_empty() {
-                    let out_samples: &[i32] = if skew_ppm.is_finite() && skew_ppm.abs() >= 2.0 {
+                if !q31_buf.is_empty()
+                    && let Some(s) = stream.as_mut()
+                {
+                    let cap_frames = s.capacity_frames().max(1);
+                    let cur_underruns = s.underruns();
+                    if cur_underruns > last_underruns {
+                        last_underruns = cur_underruns;
+                        pi_integral = 0.0;
+                    }
+                    let buf_frames = s.buffered_frames();
+                    // Overrun guard: if ringbuffer exceeds 85% capacity, drop this chunk
+                    // rather than accumulating unbounded multi-room latency or stalling UDP.
+                    if buf_frames * 100 >= cap_frames * 85 {
+                        pi_integral = 0.0;
+                        continue;
+                    }
+                    // Closed-loop PI controller on local DAC ringbuffer occupancy + sender
+                    // `skew_ppm` feedforward. Target ~100 ms buffered frames (clamped to
+                    // 15%..50% of ringbuffer capacity).
+                    let target_frames =
+                        ((spec.sample_rate as usize) / 10).clamp(cap_frames / 7, cap_frames / 2);
+                    let err_secs =
+                        (buf_frames as f64 - target_frames as f64) / f64::from(spec.sample_rate);
+                    let dt_secs = (q31_buf.len() / usize::from(spec.channels.max(1))) as f64
+                        / f64::from(spec.sample_rate);
+                    pi_integral = (pi_integral + err_secs * dt_secs).clamp(-0.5, 0.5);
+                    let ff_ppm = if skew_ppm.is_finite() { skew_ppm } else { 0.0 };
+                    let total_ppm =
+                        (ff_ppm + 150.0 * err_secs + 15.0 * pi_integral).clamp(-1000.0, 1000.0);
+
+                    let out_samples: &[i32] = if total_ppm.abs() >= 2.0 {
                         let r = drift_resampler
                             .get_or_insert_with(|| DriftResampler::new(spec.channels));
-                        r.set_rate_adjust_ppm(skew_ppm);
+                        r.set_rate_adjust_ppm(total_ppm);
                         r.process(&q31_buf, &mut drift_buf);
                         &drift_buf
                     } else {
+                        if let Some(r) = drift_resampler.as_mut() {
+                            r.update_passthrough(&q31_buf);
+                        }
                         &q31_buf
                     };
 
-                    if let Some(s) = stream.as_mut()
-                        && let Err(err) = s.write_q31(out_samples)
-                    {
+                    if let Err(err) = s.write_q31(out_samples) {
                         if !cancel.load(Ordering::Acquire) {
                             let _ = ev_tx.send(SongcastEvent::Error {
                                 generation,

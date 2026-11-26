@@ -36,7 +36,8 @@ use crate::upnp::schema::{
     service_type as upnp_service_type, soap_response_xml,
 };
 
-const MAX_SOAP_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SOAP_BODY_BYTES: usize = 512 * 1024;
+const MAX_UPNP_SUBS_PER_PEER: usize = 16;
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SOAP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_CONNS: usize = 128;
@@ -179,6 +180,7 @@ pub async fn serve_http(
         };
 
         let peer_ip = peer.ip();
+        let peer_allowed = state.filter.as_ref().is_none_or(|f| f.allows(peer_ip));
         let state = state.clone();
         let mut conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -189,10 +191,16 @@ pub async fn serve_http(
                 async move { Ok::<_, Infallible>(handle_request(req, peer_ip, state).await) }
             });
 
+            // Never allow keep-alive on unauthorized peers so they cannot hold
+            // connection slots; close immediately after the 403 response.
             let conn = http1::Builder::new()
-                .keep_alive(true)
+                .keep_alive(peer_allowed)
                 .timer(TokioTimer::new())
-                .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
+                .header_read_timeout(if peer_allowed {
+                    HTTP_HEADER_READ_TIMEOUT
+                } else {
+                    Duration::from_secs(2)
+                })
                 .serve_connection(io, svc);
             tokio::pin!(conn);
             tokio::select! {
@@ -216,7 +224,7 @@ async fn handle_request(
     if let Some(filter) = &state.filter
         && !filter.allows(peer_ip)
     {
-        return empty_response(StatusCode::FORBIDDEN, &state.server_header);
+        return empty_close_response(StatusCode::FORBIDDEN, &state.server_header);
     }
 
     let path = req.uri().path().to_string();
@@ -381,13 +389,13 @@ async fn read_soap_body(
             )));
         }
     };
-    let Ok(body_str) = std::str::from_utf8(&body_bytes) else {
+    let Ok(body_str) = String::from_utf8(body_bytes.into()) else {
         return Err(Box::new(empty_response(
             StatusCode::BAD_REQUEST,
             server_header,
         )));
     };
-    Ok((soap_action, body_str.to_string()))
+    Ok((soap_action, body_str))
 }
 
 async fn handle_oh_soap(
@@ -400,21 +408,26 @@ async fn handle_oh_soap(
         Err(resp) => return *resp,
     };
 
-    match state
-        .oh_registry
-        .dispatch_soap(slug, soap_action.as_deref(), &body_str)
-    {
-        Ok(output) => {
+    let registry = state.oh_registry.clone();
+    let slug_owned = slug.to_string();
+    let dispatched = tokio::task::spawn_blocking(move || {
+        registry.dispatch_soap(&slug_owned, soap_action.as_deref(), &body_str)
+    })
+    .await;
+
+    match dispatched {
+        Ok(Ok(output)) => {
             if !output.mutated_services.is_empty() {
                 state.coordinator.notify_openhome(output.mutated_services);
             }
             soap_http_response(StatusCode::OK, output.response_xml, &state.server_header)
         }
-        Err(fault) => soap_http_response(
+        Ok(Err(fault)) => soap_http_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             encode_oh_fault(&fault),
             &state.server_header,
         ),
+        Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR, &state.server_header),
     }
 }
 
@@ -525,16 +538,9 @@ async fn handle_upnp_soap(
     };
 
     let action = match (action_from_hdr, body_action) {
-        (Some(h), Some(b)) if h != b => {
-            return soap_http_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                UpnpFault::INVALID_ACTION.to_soap_xml(),
-                &state.server_header,
-            );
-        }
-        (Some(h), _) => h,
-        (None, Some(b)) => b,
-        (None, None) => {
+        (Some(h), Some(b)) if h == b => h,
+        (Some(h), None) => h,
+        _ => {
             return soap_http_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 UpnpFault::INVALID_ACTION.to_soap_xml(),
@@ -551,16 +557,21 @@ async fn handle_upnp_soap(
         );
     };
 
-    match state.coordinator.call_upnp(service, &action, &args) {
-        Ok(fields) => {
+    let coord = Arc::clone(&state.coordinator);
+    let action_owned = action.clone();
+    let res =
+        tokio::task::spawn_blocking(move || coord.call_upnp(service, &action_owned, &args)).await;
+    match res {
+        Ok(Ok(fields)) => {
             let xml = soap_response_xml(service, &action, spec.outputs, &fields);
             soap_http_response(StatusCode::OK, xml, &state.server_header)
         }
-        Err(fault) => soap_http_response(
+        Ok(Err(fault)) => soap_http_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             fault.to_soap_xml(),
             &state.server_header,
         ),
+        Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR, &state.server_header),
     }
 }
 
@@ -611,7 +622,10 @@ fn handle_upnp_events(
             {
                 let mut subs = state.coordinator.upnp_subs().lock().unwrap();
                 subs.expire_stale(now);
-                if subs.subs.len() >= MAX_UPNP_SUBSCRIPTIONS {
+                let norm_peer = normalize_ip(peer_ip);
+                let peer_count = subs.subs.values().filter(|s| s.peer == norm_peer).count();
+                if subs.subs.len() >= MAX_UPNP_SUBSCRIPTIONS || peer_count >= MAX_UPNP_SUBS_PER_PEER
+                {
                     return empty_response(StatusCode::SERVICE_UNAVAILABLE, &state.server_header);
                 }
                 subs.subs.insert(

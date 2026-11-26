@@ -358,6 +358,20 @@ impl DriftResampler {
         self.has_prev = false;
     }
 
+    /// Record the last frame of a passthrough (unresampled) chunk so re-engaging
+    /// drift compensation later interpolates smoothly without a click.
+    pub fn update_passthrough(&mut self, input: &[i32]) {
+        let ch = self.channels;
+        let in_frames = input.len() / ch;
+        if in_frames > 0 {
+            let last_off = (in_frames - 1) * ch;
+            self.prev_frame
+                .copy_from_slice(&input[last_off..last_off + ch]);
+            self.has_prev = true;
+            self.phase = 0.0;
+        }
+    }
+
     /// Resample interleaved Q31 `input` into `out` (cleared first).
     pub fn process(&mut self, input: &[i32], out: &mut Vec<i32>) {
         out.clear();
@@ -375,25 +389,22 @@ impl DriftResampler {
         out.reserve(est_frames * ch);
 
         // Index -1 refers to `self.prev_frame`; 0..in_frames refer to `input`.
-        while self.phase < in_frames as f64 {
+        // Stop before `in_frames - 1` so `next_idx` is always `< in_frames`;
+        // subtracting `in_frames` then places `self.phase` in `[-1.0, 0.0)`
+        // for seamless `prev_frame -> input[0]` interpolation on the next chunk.
+        let limit = (in_frames - 1) as f64;
+        while self.phase < limit {
             let idx = self.phase.floor() as isize;
             let frac = self.phase - idx as f64;
-            let next_idx = idx + 1;
+            let next_idx = (idx + 1) as usize;
             let f0 = if idx < 0 {
                 &self.prev_frame[..]
             } else {
                 let o = (idx as usize) * ch;
                 &input[o..o + ch]
             };
-            let f1 = if next_idx < 0 {
-                &self.prev_frame[..]
-            } else if (next_idx as usize) < in_frames {
-                let o = (next_idx as usize) * ch;
-                &input[o..o + ch]
-            } else {
-                let o = (in_frames - 1) * ch;
-                &input[o..o + ch]
-            };
+            let f1_off = next_idx * ch;
+            let f1 = &input[f1_off..f1_off + ch];
             for c in 0..ch {
                 let a = f0[c] as f64;
                 let b = f1[c] as f64;
@@ -571,8 +582,35 @@ mod tests {
         assert_eq!(out.len() % 2, 0);
         let out_frames = out.len() / 2;
         assert!(
-            (998..=1000).contains(&out_frames),
+            (997..=1000).contains(&out_frames),
             "out_frames={out_frames}"
+        );
+
+        // Multi-chunk sine wave continuity: no boundary-clamp discontinuity across 240-frame chunks.
+        let mut r2 = DriftResampler::new(1);
+        r2.set_rate_adjust_ppm(100.0);
+        let sr = 48_000.0;
+        let freq = 440.0;
+        let mut all_out = Vec::new();
+        let mut chunk_out = Vec::new();
+        for c in 0..20 {
+            let chunk: Vec<i32> = (0..240)
+                .map(|i| {
+                    let t = (c * 240 + i) as f64 / sr;
+                    ((2.0 * std::f64::consts::PI * freq * t).sin() * 1_000_000_000.0) as i32
+                })
+                .collect();
+            r2.process(&chunk, &mut chunk_out);
+            all_out.extend_from_slice(&chunk_out);
+        }
+        let max_diff = all_out
+            .windows(2)
+            .map(|w| (w[1] as i64 - w[0] as i64).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_diff < 65_000_000,
+            "boundary discontinuity detected: max_diff={max_diff}"
         );
     }
 }

@@ -10,6 +10,7 @@ pub mod upnp;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use openhome_core::DeviceDescription;
@@ -201,6 +202,7 @@ pub struct RunningEndpoint {
     coordinator: Arc<EndpointCoordinator>,
     sender: Option<Arc<SongcastSender>>,
     shutdown_tx: watch::Sender<bool>,
+    shutdown_done: AtomicBool,
     monitor_task: Option<JoinHandle<()>>,
     http_task: Option<JoinHandle<()>>,
     ssdp_task: Option<JoinHandle<()>>,
@@ -221,9 +223,9 @@ impl RunningEndpoint {
             .unwrap_or(&name)
             .to_string();
 
-        let filter = match cfg.controller.as_deref().map(str::trim) {
-            Some(s) if !s.is_empty() => Some(Arc::new(ControllerFilter::parse(s)?)),
-            _ => None,
+        let filter = match cfg.controller.as_deref() {
+            Some(s) => Some(Arc::new(ControllerFilter::parse(s)?)),
+            None => None,
         };
 
         let binding = resolve_listen(&cfg.listen)?;
@@ -402,6 +404,7 @@ impl RunningEndpoint {
             coordinator,
             sender,
             shutdown_tx,
+            shutdown_done: AtomicBool::new(false),
             monitor_task: Some(monitor_task),
             http_task: Some(http_task),
             ssdp_task,
@@ -435,7 +438,8 @@ impl RunningEndpoint {
     /// Gracefully stop HTTP, SSDP, monitor task, audio playback, and Songcast sender.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
-        self.coordinator.shutdown();
+        // Drain network & monitor tasks first so no in-flight SOAP call can
+        // re-open playback after `coordinator.shutdown()` runs.
         if let Some(t) = self.ssdp_task.take() {
             let _ = t.await;
         }
@@ -445,8 +449,12 @@ impl RunningEndpoint {
         if let Some(t) = self.monitor_task.take() {
             let _ = t.await;
         }
+        if !self.shutdown_done.swap(true, Ordering::AcqRel) {
+            let coord = Arc::clone(&self.coordinator);
+            let _ = tokio::task::spawn_blocking(move || coord.shutdown()).await;
+        }
         if let Some(mut sender) = self.sender.take() {
-            // Wait briefly for any in-flight `on_halt` task cloning `sender` to finish.
+            // Wait briefly for any in-flight Songcast tap command to finish.
             for _ in 0..20 {
                 match Arc::try_unwrap(sender) {
                     Ok(owned) => {
@@ -466,7 +474,9 @@ impl RunningEndpoint {
 impl Drop for RunningEndpoint {
     fn drop(&mut self) {
         let _ = self.shutdown_tx.send(true);
-        self.coordinator.shutdown();
+        if !self.shutdown_done.swap(true, Ordering::AcqRel) {
+            self.coordinator.shutdown();
+        }
     }
 }
 
