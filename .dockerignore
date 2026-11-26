@@ -8,7 +8,5 @@
 !interop/*.py
 !interop/pyproject.toml
 !interop/uv.lock
-!interop/testdata/
-!interop/testdata/*.json
 !scripts/
 !scripts/check.sh

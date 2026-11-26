@@ -23,12 +23,23 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Rust tests and HTTP interoperability suite
-        run: docker build --target check --progress plain .
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          target: check
+          cache-from: type=gha,scope=check
+          cache-to: type=gha,mode=max,scope=check
       - name: Smoke-test the final image as its non-root user
-        run: |
-          docker build -t tacet-endpoint:smoke .
-          docker run --rm --network none tacet-endpoint:smoke -list-devices
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          load: true
+          tags: tacet-endpoint:smoke
+          cache-from: type=gha,scope=check
+      - name: Verify non-root runtime binary
+        run: docker run --rm --network none tacet-endpoint:smoke -list-devices
 
   build:
     needs: check
@@ -68,6 +79,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.target }}
       - name: Clippy and unit tests
         if: matrix.target != 'x86_64-apple-darwin'
         run: |
@@ -124,6 +138,10 @@ jobs:
           build-args: VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('dev-{0}', github.sha) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=image
+            type=gha,scope=check
+          cache-to: type=gha,mode=max,scope=image
 
   release:
     needs: [check, build, image]
