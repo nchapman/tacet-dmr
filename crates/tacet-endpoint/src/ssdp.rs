@@ -50,9 +50,6 @@ pub async fn run_ssdp(
     tick.tick().await; // consume immediate tick
 
     let mut buf = [0u8; 4096];
-    let mut last_reply = tokio::time::Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap_or_else(tokio::time::Instant::now);
     loop {
         tokio::select! {
             res = shutdown_rx.changed() => {
@@ -77,11 +74,6 @@ pub async fn run_ssdp(
                                     .eq_ignore_ascii_case("ssdp:discover")
                             })
                         {
-                            let now = tokio::time::Instant::now();
-                            if now.duration_since(last_reply) < Duration::from_millis(20) {
-                                continue;
-                            }
-                            last_reply = now;
                             for dev in &devices {
                                 for target in &dev.targets {
                                     if search_target_matches(&search.st, target) {
